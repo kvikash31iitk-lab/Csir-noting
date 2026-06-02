@@ -1,0 +1,10 @@
+node_modules/
+www/
+# Capacitor / Android build outputs (the source android/ project IS committed)
+android/.gradle/
+android/build/
+android/app/build/
+android/capacitor-cordova-android-plugins/
+android/app/src/main/assets/public/
+.DS_Store
+*.log

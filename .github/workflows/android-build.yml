@@ -1,0 +1,61 @@
+name: Build Android APK
+
+# Produces an installable debug .apk you can download from the run's
+# "Artifacts" section. Runs on every push to the feature branch and can also
+# be started manually from the Actions tab (Run workflow).
+on:
+  push:
+    branches:
+      - claude/note-sheet-generator-app-tbVN7
+    paths:
+      - "NoteSheetGenerator.jsx"
+      - "android-app/**"
+      - ".github/workflows/android-build.yml"
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android-app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build web assets
+        run: npm run build:web
+
+      - name: Sync Capacitor (copy web assets into Android project)
+        run: npx cap sync android
+
+      - name: Build debug APK
+        run: |
+          chmod +x android/gradlew
+          cd android
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CSIR-Note-Sheet-debug-apk
+          path: android-app/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

@@ -1,0 +1,8 @@
+{
+  "appId": "in.csir.tkdl.notesheet",
+  "appName": "CSIR Note Sheet",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": true
+  }
+}
