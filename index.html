@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Note Sheet Generator — CSIR TKDL Unit</title>
+
+    <!-- Tailwind (CDN, for local preview) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- DOCX read / write libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+    <script src="https://unpkg.com/docx@8.5.0/build/index.umd.js"></script>
+
+    <!-- React + Babel (for transforming the JSX artifact in-browser) -->
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@18.3.1",
+          "react-dom": "https://esm.sh/react-dom@18.3.1",
+          "react-dom/client": "https://esm.sh/react-dom@18.3.1/client"
+        }
+      }
+    </script>
+    <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!--
+      LOCAL-PREVIEW SHIM ONLY.
+      In the real Claude artifact environment, window.storage is provided by the
+      host. For local testing we back it with localStorage so the app is usable.
+      The shim is namespaced so "shared" vs personal keys don't collide.
+    -->
+    <script>
+      (function () {
+        if (window.storage) return; // host already provides it
+        const ns = (shared) => (shared ? "shared::" : "personal::");
+        window.storage = {
+          async get(key, opts = {}) {
+            return localStorage.getItem(ns(opts.shared) + key);
+          },
+          async set(key, value, opts = {}) {
+            localStorage.setItem(ns(opts.shared) + key, value);
+          },
+          async delete(key, opts = {}) {
+            localStorage.removeItem(ns(opts.shared) + key);
+          },
+          async list(opts = {}) {
+            const prefix = ns(opts.shared) + (opts.prefix || "");
+            const keys = [];
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              if (k && k.startsWith(prefix))
+                keys.push(k.slice(ns(opts.shared).length));
+            }
+            return keys;
+          },
+        };
+      })();
+    </script>
+
+    <!-- Load and transform the single-file React artifact -->
+    <script type="module">
+      // Fetch the JSX source, transform it with Babel (keeping ES modules so
+      // the `import react` lines resolve via the importmap), then import it as
+      // a blob module. This lets the canonical artifact stay a plain .jsx file.
+      const src = await (await fetch("./NoteSheetGenerator.jsx")).text();
+      const { code } = Babel.transform(src, {
+        presets: [["react"]],
+      });
+      const blob = new Blob([code], { type: "text/javascript" });
+      const url = URL.createObjectURL(blob);
+      const { default: App } = await import(url);
+
+      const React = (await import("react")).default;
+      const { createRoot } = await import("react-dom/client");
+      createRoot(document.getElementById("root")).render(
+        React.createElement(App)
+      );
+    </script>
+  </body>
+</html>
