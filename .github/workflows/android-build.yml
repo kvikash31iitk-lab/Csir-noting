@@ -16,6 +16,8 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: android-app
@@ -59,3 +61,19 @@ jobs:
           name: CSIR-Note-Sheet-debug-apk
           path: android-app/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Rename APK for release
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/CSIR-Note-Sheet.apk
+
+      - name: Publish APK to GitHub Release (stable direct link)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-latest
+          name: CSIR Note Sheet — latest Android build
+          body: |
+            Latest installable debug APK for the CSIR Note Sheet app.
+            Direct download: the **CSIR-Note-Sheet.apk** asset below.
+            Updated automatically on every build.
+          files: android-app/dist/CSIR-Note-Sheet.apk
