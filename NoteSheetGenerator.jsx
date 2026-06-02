@@ -346,9 +346,10 @@ export default function App() {
   const [refLoading, setRefLoading] = useState(false);
 
   /* ----- permanent learning material (typed/pasted knowledge) ----- */
-  const [knowledge, setKnowledge] = useState([]); // [{id, text, addedAt}]
+  const [knowledge, setKnowledge] = useState([]); // [{id, text, addedAt, source?}]
   const [knowledgeInput, setKnowledgeInput] = useState("");
   const [savingKnowledge, setSavingKnowledge] = useState(false);
+  const [knowledgeFileLoading, setKnowledgeFileLoading] = useState(false);
 
   /* ----- signature add form ----- */
   const [showChainForm, setShowChainForm] = useState(false);
@@ -379,6 +380,7 @@ export default function App() {
   const sessionIdRef = useRef(generateUUID());
   const chatEndRef = useRef(null);
   const refFileInput = useRef(null);
+  const knowledgeFileInput = useRef(null);
 
   /* ============================================================== *
    *  MOUNT: load CDN libs, seed baseline, load library + session
@@ -466,6 +468,61 @@ export default function App() {
       showToast("Storage error — changes may not persist", "error");
     } finally {
       setSavingKnowledge(false);
+    }
+  }
+
+  /* Upload an older note file -> distill reusable learnings -> permanent memory */
+  async function handleKnowledgeFile(file) {
+    if (!file) return;
+    setKnowledgeFileLoading(true);
+    let rawText = "";
+    try {
+      rawText = await readFileAsText(file);
+    } catch (e) {
+      setKnowledgeFileLoading(false);
+      showToast(
+        "Could not read this file. Please try a different .docx or .pdf file.",
+        "error"
+      );
+      return;
+    }
+
+    let learnings = null;
+    try {
+      const sys =
+        "You are distilling permanent, reusable learning points from an older government office noting document so future notes match this office's style and rules. Return only raw JSON with no markdown, no backticks, no preamble: { learnings: array of 3 to 7 short instruction strings capturing tone, structure, phrasing, and any rules to always follow }";
+      const resp = await callClaude(sys, rawText);
+      const parsed = parseJSON(resp);
+      learnings =
+        parsed && Array.isArray(parsed.learnings) ? parsed.learnings : null;
+    } catch (e) {
+      // fall through to raw-text fallback below
+    }
+
+    try {
+      const list = (await storageGet("lib:knowledge", true)) || [];
+      const text = learnings
+        ? "From " + file.name + ":\n• " + learnings.join("\n• ")
+        : "From " + file.name + ":\n" + rawText.slice(0, 4000);
+      list.push({
+        id: generateUUID(),
+        text,
+        addedAt: Date.now(),
+        source: file.name,
+      });
+      const ok = await storageSet("lib:knowledge", list, true);
+      if (!ok) throw new Error("storage");
+      await refreshKnowledge();
+      showToast(
+        learnings
+          ? "Learned from " + file.name + " ✓"
+          : "Saved text from " + file.name,
+        "success"
+      );
+    } catch (e) {
+      showToast("Storage error — changes may not persist", "error");
+    } finally {
+      setKnowledgeFileLoading(false);
     }
   }
 
@@ -1299,9 +1356,16 @@ export default function App() {
                   key={k.id}
                   className="flex items-start justify-between gap-2 rounded bg-white p-2 shadow-sm transition-all duration-200 hover:shadow"
                 >
-                  <p className="min-w-0 whitespace-pre-wrap break-words text-xs text-gray-700">
-                    {k.text}
-                  </p>
+                  <div className="min-w-0">
+                    {k.source && (
+                      <span className="mb-1 inline-block rounded bg-blue-50 px-1 text-[10px] font-medium text-blue-600">
+                        📎 {k.source}
+                      </span>
+                    )}
+                    <p className="whitespace-pre-wrap break-words text-xs text-gray-700">
+                      {k.text}
+                    </p>
+                  </div>
                   <button
                     onClick={() => deleteKnowledge(k.id)}
                     className="shrink-0 rounded px-1 text-gray-400 transition-colors duration-200 hover:bg-red-50 hover:text-red-500"
@@ -1328,6 +1392,36 @@ export default function App() {
           >
             {savingKnowledge ? <Spinner /> : null}
             {savingKnowledge ? "Saving…" : "+ Save to Permanent Memory"}
+          </button>
+
+          <div className="my-2 flex items-center gap-2">
+            <span className="h-px flex-1 bg-gray-200" />
+            <span className="text-[10px] text-gray-400">or</span>
+            <span className="h-px flex-1 bg-gray-200" />
+          </div>
+
+          <input
+            ref={knowledgeFileInput}
+            type="file"
+            accept=".docx,.pdf"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files && e.target.files[0];
+              if (f) handleKnowledgeFile(f);
+              e.target.value = "";
+            }}
+          />
+          <button
+            disabled={knowledgeFileLoading}
+            onClick={() =>
+              knowledgeFileInput.current && knowledgeFileInput.current.click()
+            }
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-gray-300 bg-white py-1.5 text-xs font-medium text-gray-600 transition-all duration-200 hover:border-blue-400 hover:bg-blue-50 hover:text-blue-600 disabled:opacity-50"
+          >
+            {knowledgeFileLoading ? <Spinner /> : null}
+            {knowledgeFileLoading
+              ? "Learning from file…"
+              : "📂 Upload Older Note (PDF / DOCX)"}
           </button>
         </div>
 
