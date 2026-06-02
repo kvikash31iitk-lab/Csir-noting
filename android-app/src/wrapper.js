@@ -197,8 +197,12 @@
     var btn = document.createElement("button");
     btn.textContent = "⚙";
     btn.title = "AI Settings (API key)";
+    // sit above the mobile bottom tab bar on phones
+    var isMobile = window.matchMedia("(max-width: 767px)").matches;
     btn.style.cssText =
-      "position:fixed;bottom:12px;left:12px;z-index:9999;width:40px;height:40px;border-radius:9999px;border:none;background:#2563eb;color:#fff;font-size:18px;box-shadow:0 2px 8px rgba(0,0,0,.3);cursor:pointer;";
+      "position:fixed;bottom:" +
+      (isMobile ? 72 : 16) +
+      "px;left:12px;z-index:9999;width:40px;height:40px;border-radius:9999px;border:none;background:#2563eb;color:#fff;font-size:18px;box-shadow:0 2px 8px rgba(0,0,0,.3);cursor:pointer;";
     btn.onclick = openPanel;
     document.body.appendChild(btn);
 

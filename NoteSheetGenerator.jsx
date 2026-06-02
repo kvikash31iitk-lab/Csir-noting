@@ -376,6 +376,7 @@ export default function App() {
   const [aiTyping, setAiTyping] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
   const [tabOffset, setTabOffset] = useState(0);
+  const [activePanel, setActivePanel] = useState("library"); // mobile: which column is shown
 
   const sessionIdRef = useRef(generateUUID());
   const chatEndRef = useRef(null);
@@ -1269,9 +1270,15 @@ export default function App() {
    *  JSX
    * ============================================================== */
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-white font-sans text-sm text-gray-800">
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-white font-sans text-sm text-gray-800">
+      <div className="flex min-h-0 flex-1 overflow-hidden">
       {/* ===================== LEFT COLUMN ===================== */}
-      <div className="flex w-1/4 flex-col overflow-y-auto border-r border-gray-200 bg-gray-50 p-4">
+      <div
+        className={
+          (activePanel === "library" ? "flex" : "hidden") +
+          " w-full flex-col overflow-y-auto border-r border-gray-200 bg-gray-50 p-4 md:flex md:w-1/4"
+        }
+      >
         <h2 className="mb-3 text-lg font-bold">📚 Library</h2>
 
         {/* Reference Notings */}
@@ -1571,7 +1578,12 @@ export default function App() {
       </div>
 
       {/* ===================== MIDDLE COLUMN ===================== */}
-      <div className="flex w-2/5 flex-col border-r border-gray-200 bg-white">
+      <div
+        className={
+          (activePanel === "instructions" ? "flex" : "hidden") +
+          " w-full flex-col border-r border-gray-200 bg-white md:flex md:w-2/5"
+        }
+      >
         <div className="border-b border-gray-200 p-4">
           <h2 className="text-lg font-bold">💬 Note Instructions</h2>
         </div>
@@ -1716,7 +1728,12 @@ export default function App() {
       </div>
 
       {/* ===================== RIGHT COLUMN ===================== */}
-      <div className="flex w-[35%] flex-col bg-white">
+      <div
+        className={
+          (activePanel === "preview" ? "flex" : "hidden") +
+          " w-full flex-col bg-white md:flex md:w-[35%]"
+        }
+      >
         <div className="flex items-center justify-between border-b border-gray-200 p-4">
           <h2 className="text-lg font-bold">📄 Note Preview</h2>
           {versions.length > 1 && (
@@ -1825,6 +1842,30 @@ export default function App() {
           )}
         </div>
       </div>
+      </div>
+
+      {/* ===== mobile bottom navigation (hidden on desktop) ===== */}
+      <nav className="flex shrink-0 border-t border-gray-200 bg-white md:hidden">
+        {[
+          { id: "library", label: "Library", icon: "📚" },
+          { id: "instructions", label: "Note", icon: "💬" },
+          { id: "preview", label: "Preview", icon: "📄" },
+        ].map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setActivePanel(t.id)}
+            className={
+              "flex flex-1 flex-col items-center gap-0.5 py-2 text-[11px] font-medium transition-colors duration-200 " +
+              (activePanel === t.id
+                ? "border-t-2 border-blue-600 text-blue-600"
+                : "border-t-2 border-transparent text-gray-500")
+            }
+          >
+            <span className="text-base leading-none">{t.icon}</span>
+            {t.label}
+          </button>
+        ))}
+      </nav>
 
       {/* ===================== TOASTS ===================== */}
       <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
