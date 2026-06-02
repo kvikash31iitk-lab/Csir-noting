@@ -345,6 +345,11 @@ export default function App() {
   const [signatures, setSignatures] = useState([]); // [{chain, label}]
   const [refLoading, setRefLoading] = useState(false);
 
+  /* ----- permanent learning material (typed/pasted knowledge) ----- */
+  const [knowledge, setKnowledge] = useState([]); // [{id, text, addedAt}]
+  const [knowledgeInput, setKnowledgeInput] = useState("");
+  const [savingKnowledge, setSavingKnowledge] = useState(false);
+
   /* ----- signature add form ----- */
   const [showChainForm, setShowChainForm] = useState(false);
   const [chainRoles, setChainRoles] = useState("");
@@ -402,6 +407,7 @@ export default function App() {
 
         await refreshLibrary();
         await refreshSignatures();
+        await refreshKnowledge();
         await restoreSession();
       } catch (e) {
         showToast("Storage error — changes may not persist", "error");
@@ -437,6 +443,42 @@ export default function App() {
   async function refreshSignatures() {
     const sigs = await storageGet("lib:signatures", true);
     if (Array.isArray(sigs)) setSignatures(sigs);
+  }
+
+  async function refreshKnowledge() {
+    const k = await storageGet("lib:knowledge", true);
+    setKnowledge(Array.isArray(k) ? k : []);
+  }
+
+  async function addKnowledge() {
+    const text = knowledgeInput.trim();
+    if (!text) return;
+    setSavingKnowledge(true);
+    try {
+      const list = (await storageGet("lib:knowledge", true)) || [];
+      list.push({ id: generateUUID(), text, addedAt: Date.now() });
+      const ok = await storageSet("lib:knowledge", list, true);
+      if (!ok) throw new Error("storage");
+      await refreshKnowledge();
+      setKnowledgeInput("");
+      showToast("Learning material saved ✓", "success");
+    } catch (e) {
+      showToast("Storage error — changes may not persist", "error");
+    } finally {
+      setSavingKnowledge(false);
+    }
+  }
+
+  async function deleteKnowledge(id) {
+    try {
+      const list = (await storageGet("lib:knowledge", true)) || [];
+      const next = list.filter((k) => k.id !== id);
+      await storageSet("lib:knowledge", next, true);
+      await refreshKnowledge();
+      showToast("Learning note removed", "info");
+    } catch (e) {
+      showToast("Storage error — changes may not persist", "error");
+    }
   }
 
   async function persistSession(partial) {
@@ -758,11 +800,19 @@ export default function App() {
   async function buildSystemPrompt() {
     const patterns = (await storageGet("lib:patterns", true)) || SEED_PATTERNS;
     const sigs = (await storageGet("lib:signatures", true)) || SEED_SIGNATURES;
+    const knowledgeList = (await storageGet("lib:knowledge", true)) || [];
+    const knowledgeText = Array.isArray(knowledgeList)
+      ? knowledgeList.map((k) => (k && k.text) || "").filter(Boolean)
+      : [];
     return (
       "You are a senior government office noting writer for CSIR TKDL Unit Finance and Accounts section. You write formal office noting documents in the exact style of this organization. You have learned these style patterns from reference documents: " +
       JSON.stringify(patterns) +
       ". Known signature chains: " +
       JSON.stringify(sigs) +
+      (knowledgeText.length
+        ? ". You must always follow these standing instructions and permanent learning material provided by the office: " +
+          JSON.stringify(knowledgeText)
+        : "") +
       ". Return only raw JSON with no markdown, no backticks, no preamble, using this exact structure:\n" +
       "{\n" +
       "  header: organization header string,\n" +
@@ -1223,6 +1273,61 @@ export default function App() {
           >
             {refLoading ? <Spinner /> : null}
             {refLoading ? "Processing…" : "+ Add Reference Noting"}
+          </button>
+        </div>
+
+        <hr className="my-3 border-gray-200" />
+
+        {/* Permanent Learning Material */}
+        <div className="mb-2">
+          <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500">
+            🧠 Permanent Learning Material
+          </h3>
+          <p className="mb-2 text-[10px] text-gray-400">
+            Type or paste rules, guidelines, or standard phrasing. The AI will
+            always follow these when writing every note.
+          </p>
+
+          {knowledge.length === 0 ? (
+            <p className="mb-2 rounded bg-white p-2 text-xs text-gray-400">
+              No learning notes yet. Add guidance the AI should always follow.
+            </p>
+          ) : (
+            <ul className="mb-2 space-y-1">
+              {knowledge.map((k) => (
+                <li
+                  key={k.id}
+                  className="flex items-start justify-between gap-2 rounded bg-white p-2 shadow-sm transition-all duration-200 hover:shadow"
+                >
+                  <p className="min-w-0 whitespace-pre-wrap break-words text-xs text-gray-700">
+                    {k.text}
+                  </p>
+                  <button
+                    onClick={() => deleteKnowledge(k.id)}
+                    className="shrink-0 rounded px-1 text-gray-400 transition-colors duration-200 hover:bg-red-50 hover:text-red-500"
+                    title="Delete"
+                  >
+                    ×
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <textarea
+            rows={3}
+            value={knowledgeInput}
+            onChange={(e) => setKnowledgeInput(e.target.value)}
+            placeholder="e.g. Always cite the relevant GFR 2017 rule. Always end the body with 'Submitted for further consideration and necessary action please.'"
+            className="w-full resize-none rounded-lg border border-gray-300 px-2 py-1 text-xs transition-all duration-200 focus:border-blue-400 focus:outline-none"
+          />
+          <button
+            disabled={savingKnowledge || !knowledgeInput.trim()}
+            onClick={addKnowledge}
+            className="mt-1 flex w-full items-center justify-center gap-2 rounded-lg border border-blue-600 bg-white py-1.5 text-xs font-medium text-blue-600 transition-all duration-200 hover:bg-blue-50 disabled:opacity-50"
+          >
+            {savingKnowledge ? <Spinner /> : null}
+            {savingKnowledge ? "Saving…" : "+ Save to Permanent Memory"}
           </button>
         </div>
 
