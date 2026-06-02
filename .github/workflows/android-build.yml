@@ -1,4 +1,5 @@
 name: Build Android APK
+# build trigger bump: 1
 
 # Produces an installable debug .apk you can download from the run's
 # "Artifacts" section. Runs on every push to the feature branch and can also
