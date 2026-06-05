@@ -1,0 +1,8 @@
+# Netlify configuration for hosting the CSIR Note Sheet web app.
+# Used when you connect this GitHub repo to Netlify ("Import from Git").
+# Netlify will build the web assets and publish them automatically on every push.
+
+[build]
+  base = "android-app"
+  command = "npm install && npm run build:web"
+  publish = "www"
