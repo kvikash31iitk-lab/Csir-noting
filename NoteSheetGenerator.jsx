@@ -606,6 +606,7 @@ export default function App() {
   const [showLogin, setShowLogin] = useState(false);
   const [loginPassword, setLoginPassword] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
+  const [teaching, setTeaching] = useState(false);
 
   /* ----- permanent learning material (typed/pasted knowledge) ----- */
   const [knowledge, setKnowledge] = useState([]); // [{id, text, addedAt, source?}]
@@ -787,6 +788,39 @@ export default function App() {
     setLoggedIn(false);
     setRules([]);
     showToast("Signed out", "info");
+  }
+
+  /* Phase 4 learning loop: turn the latest correction into a general standing
+   * instruction the AI will follow in every future note. */
+  async function handleTeach() {
+    const lastUser = [...chatHistory].reverse().find((c) => c.role === "user");
+    const basis = (chatInput.trim() || (lastUser && lastUser.text) || "").trim();
+    if (!basis) {
+      showToast("Type or send a correction first, then Teach it", "error");
+      return;
+    }
+    setTeaching(true);
+    try {
+      let lesson = basis;
+      try {
+        const sys =
+          "You convert a one-off editing instruction for a CSIR government office note into a SHORT, general standing rule the writer wants followed in ALL future notes. Keep the user's intent, make it reusable. Return ONLY the rule text as one sentence — no preamble, no quotes.";
+        const resp = await callClaude(sys, basis);
+        if (resp && resp.trim()) lesson = resp.trim().replace(/^["']|["']$/g, "");
+      } catch (e) {
+        /* keep the raw instruction as the lesson */
+      }
+      const item = await persistLearning(lesson);
+      await refreshKnowledge();
+      showToast(
+        (item.cloud ? "Learned ☁️ — " : "Learned ✓ — ") + lesson.slice(0, 48),
+        "success"
+      );
+    } catch (e) {
+      showToast("Could not save lesson", "error");
+    } finally {
+      setTeaching(false);
+    }
   }
 
   async function handleBackup() {
@@ -2369,14 +2403,26 @@ export default function App() {
           />
           <div className="mt-2 flex items-center justify-between">
             <span className="text-[10px] text-gray-400">Ctrl+Enter to send</span>
-            <button
-              disabled={aiTyping || generating || !chatInput.trim()}
-              onClick={handleSend}
-              className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-medium text-white transition-all duration-200 hover:bg-blue-700 disabled:opacity-50"
-            >
-              {(aiTyping || generating) && <Spinner className="text-white" />}
-              Send
-            </button>
+            <div className="flex items-center gap-2">
+              {(chatInput.trim() || chatHistory.some((c) => c.role === "user")) && (
+                <button
+                  disabled={teaching || aiTyping || generating}
+                  onClick={handleTeach}
+                  title="Save this correction as a permanent rule the AI always follows"
+                  className="flex items-center gap-1 rounded-lg border border-amber-500 bg-white px-3 py-1.5 text-sm font-medium text-amber-700 transition-all duration-200 hover:bg-amber-50 disabled:opacity-50"
+                >
+                  {teaching ? <Spinner /> : "💡"} Teach this
+                </button>
+              )}
+              <button
+                disabled={aiTyping || generating || !chatInput.trim()}
+                onClick={handleSend}
+                className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-medium text-white transition-all duration-200 hover:bg-blue-700 disabled:opacity-50"
+              >
+                {(aiTyping || generating) && <Spinner className="text-white" />}
+                Send
+              </button>
+            </div>
           </div>
         </div>
       </div>
