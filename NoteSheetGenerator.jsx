@@ -42,6 +42,25 @@ const OCR_LANGS = "eng+hin";
 const UPLOAD_ACCEPT =
   ".docx,.pdf,.xlsx,.xls,.csv,.txt,.png,.jpg,.jpeg,.webp,.bmp,.tiff,.tif";
 
+// Phase B — document-level formatting applied to the preview and the DOCX.
+const DEFAULT_DOC_STYLE = {
+  fontFamily: "Times New Roman",
+  fontSize: 12, // points (body); header/department scale relative to this
+  lineSpacing: 1.5, // 1 / 1.15 / 1.5 / 2
+  align: "justify", // justify | left | center | right
+};
+const FONT_CHOICES = [
+  "Times New Roman",
+  "Arial",
+  "Calibri",
+  "Cambria",
+  "Georgia",
+  "Mangal", // Devanagari
+  "Nirmala UI", // English + Hindi
+];
+const FONT_SIZE_CHOICES = [10, 11, 12, 13, 14, 16];
+const LINE_SPACING_CHOICES = [1, 1.15, 1.5, 2];
+
 const SEED_PATTERNS = {
   toneRules: [
     "Formal third-person government style throughout",
@@ -659,6 +678,8 @@ export default function App() {
   const [aiTyping, setAiTyping] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [docStyle, setDocStyle] = useState(DEFAULT_DOC_STYLE);
+  const [showStyle, setShowStyle] = useState(false);
   const [tabOffset, setTabOffset] = useState(0);
   const [activePanel, setActivePanel] = useState("library"); // mobile: which column is shown
   // On wide screens we show all three columns at once; on phones we show one
@@ -715,6 +736,8 @@ export default function App() {
           await storageSet("lib:signatures", SEED_SIGNATURES, true);
         }
 
+        const ds = await storageGet("cfg:docStyle", true);
+        if (ds) setDocStyle({ ...DEFAULT_DOC_STYLE, ...ds });
         await refreshLibrary();
         await refreshSignatures();
         await refreshKnowledge();
@@ -1804,7 +1827,16 @@ export default function App() {
         AlignmentType,
         BorderStyle,
       } = docx;
-      const FONT = "Arial";
+      const FONT = docStyle.fontFamily;
+      const SZ = docStyle.fontSize * 2; // docx sizes are half-points
+      const ALIGN =
+        {
+          justify: AlignmentType.JUSTIFIED,
+          left: AlignmentType.LEFT,
+          center: AlignmentType.CENTER,
+          right: AlignmentType.RIGHT,
+        }[docStyle.align] || AlignmentType.JUSTIFIED;
+      const lineSp = { line: Math.round(docStyle.lineSpacing * 240), lineRule: "auto" };
 
       const titleP = (text, size) =>
         new Paragraph({
@@ -1818,14 +1850,14 @@ export default function App() {
         new Paragraph({
           ...opts,
           children: [
-            new TextRun({ text: label, bold: true, font: FONT, size: 22 }),
-            new TextRun({ text: value || "", font: FONT, size: 22 }),
+            new TextRun({ text: label, bold: true, font: FONT, size: SZ }),
+            new TextRun({ text: value || "", font: FONT, size: SZ }),
           ],
         });
 
       const children = [];
-      children.push(titleP(note.header, 28));
-      children.push(titleP(note.department, 24));
+      children.push(titleP(note.header, (docStyle.fontSize + 3) * 2));
+      children.push(titleP(note.department, (docStyle.fontSize + 1) * 2));
       // horizontal rule
       children.push(
         new Paragraph({
@@ -1848,10 +1880,10 @@ export default function App() {
       (note.paragraphs || []).forEach((p) => {
         children.push(
           new Paragraph({
-            alignment: AlignmentType.JUSTIFIED,
+            alignment: ALIGN,
             indent: { firstLine: 720 },
-            spacing: { after: 120 },
-            children: [new TextRun({ text: p, font: FONT, size: 22 })],
+            spacing: { after: 120, ...lineSp },
+            children: [new TextRun({ text: p, font: FONT, size: SZ })],
           })
         );
       });
@@ -1864,9 +1896,9 @@ export default function App() {
                 text: "    " + d.label + " : ",
                 bold: true,
                 font: FONT,
-                size: 22,
+                size: SZ,
               }),
-              new TextRun({ text: d.value || "", font: FONT, size: 22 }),
+              new TextRun({ text: d.value || "", font: FONT, size: SZ }),
             ],
           })
         );
@@ -1876,7 +1908,7 @@ export default function App() {
         new Paragraph({
           spacing: { before: 200 },
           children: [
-            new TextRun({ text: note.closingLine, font: FONT, size: 22 }),
+            new TextRun({ text: note.closingLine, font: FONT, size: SZ }),
           ],
         })
       );
@@ -1885,7 +1917,7 @@ export default function App() {
         children.push(
           new Paragraph({
             spacing: { before: 280 },
-            children: [new TextRun({ text: r, font: FONT, size: 22 })],
+            children: [new TextRun({ text: r, font: FONT, size: SZ })],
           })
         );
       });
@@ -1951,6 +1983,13 @@ export default function App() {
   const currentNote = versions[activeVersion] || null;
   const prevNote =
     activeVersion > 0 ? versions[activeVersion - 1] || null : null;
+
+  /* ---- document style (Phase B): one formatting set for preview + DOCX ---- */
+  function updateDocStyle(patch) {
+    const next = { ...docStyle, ...patch };
+    setDocStyle(next);
+    storageSet("cfg:docStyle", next, true);
+  }
 
   /* ---- inline editing (Phase A): write manual edits back into the active
    * version so the AI, the DOCX export and the session all stay in sync. ---- */
@@ -2652,6 +2691,18 @@ export default function App() {
         <div className="flex items-center justify-between border-b border-gray-200 p-4">
           <h2 className="text-lg font-bold">📄 Note Preview</h2>
           <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowStyle((s) => !s)}
+              className={
+                "rounded px-2 py-1 text-xs font-medium transition-colors duration-200 " +
+                (showStyle
+                  ? "bg-indigo-600 text-white"
+                  : "bg-gray-100 text-gray-600 hover:bg-gray-200")
+              }
+              title="Document formatting (font, size, spacing, alignment)"
+            >
+              🅰 Style
+            </button>
             {currentNote && (
               <button
                 onClick={() => {
@@ -2684,6 +2735,76 @@ export default function App() {
             )}
           </div>
         </div>
+
+        {showStyle && (
+          <div className="flex flex-wrap items-center gap-3 border-b border-indigo-100 bg-indigo-50 px-3 py-2 text-xs">
+            <label className="flex items-center gap-1">
+              <span className="text-gray-500">Font</span>
+              <select
+                value={docStyle.fontFamily}
+                onChange={(e) => updateDocStyle({ fontFamily: e.target.value })}
+                className="rounded border border-indigo-200 bg-white px-1 py-0.5"
+              >
+                {FONT_CHOICES.map((f) => (
+                  <option key={f} value={f}>{f}</option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1">
+              <span className="text-gray-500">Size</span>
+              <select
+                value={docStyle.fontSize}
+                onChange={(e) => updateDocStyle({ fontSize: parseInt(e.target.value, 10) })}
+                className="rounded border border-indigo-200 bg-white px-1 py-0.5"
+              >
+                {FONT_SIZE_CHOICES.map((s) => (
+                  <option key={s} value={s}>{s} pt</option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1">
+              <span className="text-gray-500">Spacing</span>
+              <select
+                value={docStyle.lineSpacing}
+                onChange={(e) => updateDocStyle({ lineSpacing: parseFloat(e.target.value) })}
+                className="rounded border border-indigo-200 bg-white px-1 py-0.5"
+              >
+                {LINE_SPACING_CHOICES.map((s) => (
+                  <option key={s} value={s}>{s}×</option>
+                ))}
+              </select>
+            </label>
+            <div className="flex items-center gap-1">
+              <span className="text-gray-500">Align</span>
+              {[
+                ["left", "⬅"],
+                ["center", "⬌"],
+                ["right", "➡"],
+                ["justify", "☰"],
+              ].map(([val, icon]) => (
+                <button
+                  key={val}
+                  onClick={() => updateDocStyle({ align: val })}
+                  className={
+                    "rounded px-1.5 py-0.5 " +
+                    (docStyle.align === val
+                      ? "bg-indigo-600 text-white"
+                      : "bg-white text-gray-600 ring-1 ring-indigo-200 hover:bg-indigo-100")
+                  }
+                  title={val}
+                >
+                  {icon}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => updateDocStyle({ ...DEFAULT_DOC_STYLE })}
+              className="ml-auto rounded px-2 py-0.5 text-indigo-600 hover:bg-indigo-100"
+            >
+              Reset
+            </button>
+          </div>
+        )}
 
         {editing && (
           <div className="border-b border-emerald-100 bg-emerald-50 px-3 py-1.5 text-[11px] text-emerald-700">
@@ -2779,6 +2900,7 @@ export default function App() {
               showDiff={showDiff && !!prevNote}
               editing={editing}
               edit={edit}
+              docStyle={docStyle}
             />
           ) : (
             <p className="mt-20 text-center text-gray-400">
@@ -2893,8 +3015,18 @@ function AutoTextarea({ value, onChange, style, className, placeholder }) {
   );
 }
 
-function NotePreview({ note, prev, showDiff, editing, edit }) {
+function NotePreview({ note, prev, showDiff, editing, edit, docStyle }) {
   const labelStyle = { fontWeight: 700 };
+  const ds = docStyle || DEFAULT_DOC_STYLE;
+  const bodySize = ds.fontSize + "pt";
+  const headerSize = ds.fontSize + 3 + "pt";
+  const deptSize = ds.fontSize + 1 + "pt";
+  const paraStyle = {
+    textIndent: "2em",
+    fontSize: bodySize,
+    lineHeight: ds.lineSpacing,
+    textAlign: ds.align,
+  };
   const E = editing && edit ? edit : null;
   const inputCls =
     "w-full rounded border border-dashed border-gray-300 bg-yellow-50/40 px-1 focus:border-blue-400 focus:bg-white focus:outline-none";
@@ -2913,16 +3045,19 @@ function NotePreview({ note, prev, showDiff, editing, edit }) {
     );
 
   return (
-    <div className="mx-auto max-w-prose text-gray-900">
+    <div
+      className="mx-auto max-w-prose text-gray-900"
+      style={{ fontFamily: ds.fontFamily }}
+    >
       {E ? (
         <input
           value={note.header || ""}
           onChange={(e) => E.setField("header", e.target.value)}
           className={inputCls + " text-center font-bold"}
-          style={{ fontSize: "14pt" }}
+          style={{ fontSize: headerSize }}
         />
       ) : (
-        <p className="text-center font-bold" style={{ fontSize: "14pt" }}>
+        <p className="text-center font-bold" style={{ fontSize: headerSize }}>
           {note.header}
         </p>
       )}
@@ -2931,30 +3066,30 @@ function NotePreview({ note, prev, showDiff, editing, edit }) {
           value={note.department || ""}
           onChange={(e) => E.setField("department", e.target.value)}
           className={inputCls + " mt-1 text-center font-bold"}
-          style={{ fontSize: "12pt" }}
+          style={{ fontSize: deptSize }}
         />
       ) : (
-        <p className="text-center font-bold" style={{ fontSize: "12pt" }}>
+        <p className="text-center font-bold" style={{ fontSize: deptSize }}>
           {note.department}
         </p>
       )}
       <hr className="my-3 border-t-2 border-gray-800" />
 
-      <p style={{ fontSize: "11pt" }}>
+      <p style={{ fontSize: bodySize }}>
         <span style={labelStyle}>DATE: </span>
         <Inline field="date" value={note.date} />
       </p>
       {E || note.hindiSubject ? (
-        <p style={{ fontSize: "11pt" }}>
+        <p style={{ fontSize: bodySize }}>
           <span style={labelStyle}>विषय: </span>
           <Inline field="hindiSubject" value={note.hindiSubject} />
         </p>
       ) : null}
-      <p style={{ fontSize: "11pt" }}>
+      <p style={{ fontSize: bodySize }}>
         <span style={labelStyle}>Subject: </span>
         <Inline field="subject" value={note.subject} />
       </p>
-      <p style={{ fontSize: "11pt" }}>
+      <p style={{ fontSize: bodySize }}>
         <span style={labelStyle}>Ref: </span>
         <Inline field="reference" value={note.reference} />
       </p>
@@ -2967,7 +3102,7 @@ function NotePreview({ note, prev, showDiff, editing, edit }) {
                 value={p}
                 onChange={(e) => E.setParagraph(i, e.target.value)}
                 className={inputCls + " resize-none text-justify"}
-                style={{ fontSize: "11pt" }}
+                style={{ fontSize: bodySize }}
               />
               <div className="mt-0.5 flex gap-3 text-[10px] text-gray-400">
                 <button onClick={() => E.addParagraph(i)} className="hover:text-blue-600">
@@ -2979,11 +3114,7 @@ function NotePreview({ note, prev, showDiff, editing, edit }) {
               </div>
             </div>
           ) : (
-            <p
-              key={i}
-              className="text-justify"
-              style={{ textIndent: "2em", fontSize: "11pt" }}
-            >
+            <p key={i} style={paraStyle}>
               {showDiff ? (
                 <DiffText oldStr={(prev.paragraphs || [])[i] || ""} newStr={p} />
               ) : (
@@ -3003,7 +3134,7 @@ function NotePreview({ note, prev, showDiff, editing, edit }) {
       </div>
 
       {(note.detailsBlock || []).length > 0 || E ? (
-        <div className="mt-3 space-y-1" style={{ fontSize: "11pt" }}>
+        <div className="mt-3 space-y-1" style={{ fontSize: bodySize }}>
           {(note.detailsBlock || []).map((d, i) => {
             const oldItem = (prev && prev.detailsBlock && prev.detailsBlock[i]) || {};
             return E ? (
@@ -3058,11 +3189,11 @@ function NotePreview({ note, prev, showDiff, editing, edit }) {
           value={note.closingLine}
           onChange={(e) => E.setField("closingLine", e.target.value)}
           className={inputCls + " mt-4 resize-none"}
-          style={{ fontSize: "11pt" }}
+          style={{ fontSize: bodySize }}
           placeholder="Closing line (optional)"
         />
       ) : note.closingLine ? (
-        <p className="mt-4" style={{ fontSize: "11pt" }}>
+        <p className="mt-4" style={{ fontSize: bodySize }}>
           {note.closingLine}
         </p>
       ) : null}
@@ -3075,10 +3206,10 @@ function NotePreview({ note, prev, showDiff, editing, edit }) {
               value={r || ""}
               onChange={(e) => E.setSignature(i, e.target.value)}
               className={inputCls}
-              style={{ fontSize: "11pt" }}
+              style={{ fontSize: bodySize }}
             />
           ) : (
-            <p key={i} style={{ fontSize: "11pt" }}>
+            <p key={i} style={{ fontSize: bodySize }}>
               {r}
             </p>
           )
