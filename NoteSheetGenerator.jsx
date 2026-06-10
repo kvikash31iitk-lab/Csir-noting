@@ -603,7 +603,7 @@ export default function App() {
    *  FEATURE 1: REFERENCE NOTING UPLOAD & LEARNING
    * ============================================================== */
   async function handleRefUpload(file) {
-    if (!file) return;
+    if (!file) return false;
     setRefLoading(true);
     let rawText = "";
     try {
@@ -614,7 +614,7 @@ export default function App() {
         "Could not read this file. Please try a different .docx or .pdf file.",
         "error"
       );
-      return;
+      return false;
     }
 
     let analysis = null;
@@ -641,13 +641,13 @@ export default function App() {
     } catch (e) {
       setRefLoading(false);
       showToast("AI call failed — please retry", "error");
-      return;
+      return false;
     }
 
     if (!analysis) {
       setRefLoading(false);
       showToast("AI call failed — please retry", "error");
-      return;
+      return false;
     }
 
     try {
@@ -716,11 +716,37 @@ export default function App() {
       await refreshLibrary();
       await refreshSignatures();
       showToast("Reference noting learned ✓", "success");
+      return true;
     } catch (e) {
       showToast("Storage error — changes may not persist", "error");
+      return false;
     } finally {
       setRefLoading(false);
     }
+  }
+
+  // Upload several reference notings at once. Each needs its own AI analysis,
+  // so process sequentially and report per-file progress.
+  async function handleRefUploadMany(fileList) {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+    if (files.length === 1) {
+      await handleRefUpload(files[0]);
+      return;
+    }
+    let ok = 0;
+    for (let i = 0; i < files.length; i++) {
+      showToast(
+        "Processing " + (i + 1) + " of " + files.length + ": " + files[i].name,
+        "info"
+      );
+      const success = await handleRefUpload(files[i]);
+      if (success) ok++;
+    }
+    showToast(
+      ok + " of " + files.length + " reference noting(s) added",
+      ok === files.length ? "success" : "error"
+    );
   }
 
   async function deleteRef(id) {
@@ -1357,10 +1383,11 @@ export default function App() {
             ref={refFileInput}
             type="file"
             accept=".docx,.pdf"
+            multiple
             className="hidden"
             onChange={(e) => {
-              const f = e.target.files && e.target.files[0];
-              if (f) handleRefUpload(f);
+              const files = e.target.files;
+              if (files && files.length) handleRefUploadMany(files);
               e.target.value = "";
             }}
           />
@@ -1370,8 +1397,11 @@ export default function App() {
             className="flex w-full items-center justify-center gap-2 rounded-lg border border-blue-600 bg-white py-1.5 text-xs font-medium text-blue-600 transition-all duration-200 hover:bg-blue-50 disabled:opacity-50"
           >
             {refLoading ? <Spinner /> : null}
-            {refLoading ? "Processing…" : "+ Add Reference Noting"}
+            {refLoading ? "Processing…" : "+ Add Reference Noting(s)"}
           </button>
+          <p className="mt-1 text-[10px] text-gray-400">
+            You can select several .docx / .pdf files at once.
+          </p>
         </div>
 
         <hr className="my-3 border-gray-200" />
