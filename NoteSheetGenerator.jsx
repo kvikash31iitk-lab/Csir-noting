@@ -377,9 +377,31 @@ export default function App() {
   const [showDiff, setShowDiff] = useState(false);
   const [tabOffset, setTabOffset] = useState(0);
   const [activePanel, setActivePanel] = useState("library"); // mobile: which column is shown
+  // On wide screens we show all three columns at once; on phones we show one
+  // panel at a time (chosen via the bottom nav). Driven from JS so it never
+  // depends on a responsive CSS display override that a stale cache could break.
+  const [isDesktop, setIsDesktop] = useState(
+    typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(min-width: 768px)").matches
+  );
 
   const sessionIdRef = useRef(generateUUID());
   const chatEndRef = useRef(null);
+
+  /* track viewport so the 3-column desktop layout is reliable */
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(min-width: 768px)");
+    const onChange = () => setIsDesktop(mq.matches);
+    onChange();
+    if (mq.addEventListener) mq.addEventListener("change", onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+    return () => {
+      if (mq.removeEventListener) mq.removeEventListener("change", onChange);
+      else if (mq.removeListener) mq.removeListener(onChange);
+    };
+  }, []);
   const refFileInput = useRef(null);
   const knowledgeFileInput = useRef(null);
 
@@ -1287,8 +1309,8 @@ export default function App() {
       {/* ===================== LEFT COLUMN ===================== */}
       <div
         className={
-          (activePanel === "library" ? "flex" : "hidden") +
-          " w-full flex-col overflow-y-auto border-r border-gray-200 bg-gray-50 p-4 md:flex md:w-1/4"
+          (isDesktop || activePanel === "library" ? "flex" : "hidden") +
+          " w-full flex-col overflow-y-auto border-r border-gray-200 bg-gray-50 p-4 md:w-1/4"
         }
       >
         <h2 className="mb-3 text-lg font-bold">📚 Library</h2>
@@ -1592,8 +1614,8 @@ export default function App() {
       {/* ===================== MIDDLE COLUMN ===================== */}
       <div
         className={
-          (activePanel === "instructions" ? "flex" : "hidden") +
-          " w-full flex-col border-r border-gray-200 bg-white md:flex md:w-2/5"
+          (isDesktop || activePanel === "instructions" ? "flex" : "hidden") +
+          " w-full flex-col border-r border-gray-200 bg-white md:w-2/5"
         }
       >
         <div className="border-b border-gray-200 p-4">
@@ -1748,8 +1770,8 @@ export default function App() {
       {/* ===================== RIGHT COLUMN ===================== */}
       <div
         className={
-          (activePanel === "preview" ? "flex" : "hidden") +
-          " w-full flex-col bg-white md:flex md:w-[35%]"
+          (isDesktop || activePanel === "preview" ? "flex" : "hidden") +
+          " w-full flex-col bg-white md:w-[35%]"
         }
       >
         <div className="flex items-center justify-between border-b border-gray-200 p-4">
@@ -1863,7 +1885,8 @@ export default function App() {
       </div>
 
       {/* ===== mobile bottom navigation (hidden on desktop) ===== */}
-      <nav className="flex shrink-0 border-t border-gray-200 bg-white md:hidden">
+      {!isDesktop && (
+      <nav className="flex shrink-0 border-t border-gray-200 bg-white">
         {[
           { id: "library", label: "Library", icon: "📚" },
           { id: "instructions", label: "Note", icon: "💬" },
@@ -1884,6 +1907,7 @@ export default function App() {
           </button>
         ))}
       </nav>
+      )}
 
       {/* ===================== TOASTS ===================== */}
       <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">

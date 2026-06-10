@@ -43,8 +43,14 @@ const css = await postcss([
 });
 fs.writeFileSync(path.join(www, "app.css"), css.css);
 
-/* 3. static files */
-fs.copyFileSync(path.join(root, "src/index.html"), path.join(www, "index.html"));
+/* 3. static files (with cache-busting so browsers never serve stale assets) */
+const v = Date.now().toString(36);
+let html = fs.readFileSync(path.join(root, "src/index.html"), "utf8");
+html = html
+  .replace('href="app.css"', 'href="app.css?v=' + v + '"')
+  .replace('src="wrapper.js"', 'src="wrapper.js?v=' + v + '"')
+  .replace('src="app.bundle.js"', 'src="app.bundle.js?v=' + v + '"');
+fs.writeFileSync(path.join(www, "index.html"), html);
 fs.copyFileSync(path.join(root, "src/wrapper.js"), path.join(www, "wrapper.js"));
 
-console.log("Web build complete ->", www);
+console.log("Web build complete ->", www, "(asset version " + v + ")");
