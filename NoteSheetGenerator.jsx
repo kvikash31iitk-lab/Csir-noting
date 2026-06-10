@@ -237,6 +237,17 @@ function setApiToken(t) {
     else localStorage.removeItem("cfg::noteToken");
   } catch (_) {}
 }
+function getStored(key) {
+  try { return localStorage.getItem(key) || ""; } catch (_) { return ""; }
+}
+function setStored(key, val) {
+  try { if (val) localStorage.setItem(key, val); else localStorage.removeItem(key); } catch (_) {}
+}
+function setSession(user) {
+  // user = { username, role } or null to clear
+  setStored("cfg::role", user ? user.role || "" : "");
+  setStored("cfg::user", user ? user.username || "" : "");
+}
 async function apiFetch(pathname, opts) {
   opts = opts || {};
   const base = apiBase();
@@ -263,8 +274,11 @@ async function apiFetch(pathname, opts) {
   return await res.json();
 }
 const api = {
-  login: (password) =>
-    apiFetch("/login", { method: "POST", body: JSON.stringify({ password }) }),
+  authConfig: () => apiFetch("/auth/config"),
+  login: (username, password) =>
+    apiFetch("/login", { method: "POST", body: JSON.stringify({ username, password }) }),
+  loginGoogle: (credential) =>
+    apiFetch("/login/google", { method: "POST", body: JSON.stringify({ credential }) }),
   getBrain: () => apiFetch("/brain"),
   addLearning: (text) =>
     apiFetch("/brain/learning", { method: "POST", body: JSON.stringify({ text }) }),
@@ -603,10 +617,16 @@ export default function App() {
   /* ----- cloud login (server-side brain) ----- */
   const [cloudOn, setCloudOn] = useState(!!apiBase());
   const [loggedIn, setLoggedIn] = useState(!!apiToken());
+  const [role, setRole] = useState(getStored("cfg::role"));
+  const [userName, setUserName] = useState(getStored("cfg::user"));
   const [showLogin, setShowLogin] = useState(false);
+  const [loginUser, setLoginUser] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
+  const [googleAvailable, setGoogleAvailable] = useState(false);
   const [teaching, setTeaching] = useState(false);
+  const googleBtnRef = useRef(null);
+  const isAdmin = role === "admin";
 
   /* ----- permanent learning material (typed/pasted knowledge) ----- */
   const [knowledge, setKnowledge] = useState([]); // [{id, text, addedAt, source?}]
@@ -713,6 +733,45 @@ export default function App() {
       chatEndRef.current.scrollIntoView({ behavior: "smooth" });
   }, [chatHistory, aiTyping]);
 
+  /* Render the Google sign-in button when login is visible and the backend has
+   * GOOGLE_CLIENT_ID configured. */
+  useEffect(() => {
+    if (!cloudOn || loggedIn) {
+      setGoogleAvailable(false);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const cfg = await api.authConfig();
+        if (cancelled || !cfg || !cfg.google || !cfg.googleClientId) return;
+        setGoogleAvailable(true);
+        await loadScript("https://accounts.google.com/gsi/client");
+        if (cancelled || !window.google || !window.google.accounts) return;
+        window.google.accounts.id.initialize({
+          client_id: cfg.googleClientId,
+          callback: (resp) =>
+            resp && resp.credential && handleGoogleCredential(resp.credential),
+        });
+        if (googleBtnRef.current) {
+          googleBtnRef.current.innerHTML = "";
+          window.google.accounts.id.renderButton(googleBtnRef.current, {
+            theme: "outline",
+            size: "large",
+            text: "signin_with",
+            width: 240,
+          });
+        }
+      } catch (e) {
+        /* Google sign-in is optional */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cloudOn, loggedIn, showLogin]);
+
   /* ============================================================== *
    *  LIBRARY HELPERS
    * ============================================================== */
@@ -756,25 +815,34 @@ export default function App() {
     }
   }
 
+  function applyLogin(token, user) {
+    setApiToken(token);
+    setSession(user);
+    setRole(user.role || "");
+    setUserName(user.username || "");
+    setLoggedIn(true);
+    setShowLogin(false);
+  }
+
   async function handleLogin() {
-    const pw = loginPassword.trim();
-    if (!pw) {
-      showToast("Enter your password", "error");
+    const u = loginUser.trim();
+    const pw = loginPassword;
+    if (!u || !pw) {
+      showToast("Enter username and password", "error");
       return;
     }
     setLoggingIn(true);
     try {
-      const { token } = await api.login(pw);
-      setApiToken(token);
+      const { token, user } = await api.login(u, pw);
+      applyLogin(token, user);
+      setLoginUser("");
       setLoginPassword("");
-      setLoggedIn(true);
-      setShowLogin(false);
       await refreshCloud();
-      showToast("Signed in to your brain ✓", "success");
+      showToast("Signed in as " + user.username + " ✓", "success");
     } catch (e) {
       showToast(
-        e && e.message === "wrong password"
-          ? "Wrong password"
+        e && /wrong username|password/i.test(e.message || "")
+          ? "Wrong username or password"
           : "Sign-in failed — check the backend URL in settings",
         "error"
       );
@@ -783,8 +851,25 @@ export default function App() {
     }
   }
 
+  async function handleGoogleCredential(credential) {
+    setLoggingIn(true);
+    try {
+      const { token, user } = await api.loginGoogle(credential);
+      applyLogin(token, user);
+      await refreshCloud();
+      showToast("Signed in as " + user.username + " ✓", "success");
+    } catch (e) {
+      showToast("Google sign-in failed: " + (e && e.message), "error");
+    } finally {
+      setLoggingIn(false);
+    }
+  }
+
   function handleLogout() {
     setApiToken("");
+    setSession(null);
+    setRole("");
+    setUserName("");
     setLoggedIn(false);
     setRules([]);
     showToast("Signed out", "info");
@@ -1843,17 +1928,22 @@ export default function App() {
           <div className="mb-3 rounded-lg border border-indigo-200 bg-indigo-50 p-2 text-xs">
             {loggedIn ? (
               <div className="flex items-center justify-between gap-2">
-                <span className="font-medium text-indigo-700">
-                  ☁️ Brain connected — syncs across devices
+                <span className="min-w-0 font-medium text-indigo-700">
+                  ☁️ {userName || "Signed in"}
+                  <span className="ml-1 rounded bg-indigo-100 px-1 text-[10px] uppercase text-indigo-600">
+                    {isAdmin ? "admin" : "user"}
+                  </span>
                 </span>
                 <span className="flex shrink-0 gap-1">
-                  <button
-                    onClick={handleBackup}
-                    className="rounded px-2 py-0.5 text-indigo-600 hover:bg-indigo-100"
-                    title="Download a full backup of your brain"
-                  >
-                    Backup
-                  </button>
+                  {isAdmin && (
+                    <button
+                      onClick={handleBackup}
+                      className="rounded px-2 py-0.5 text-indigo-600 hover:bg-indigo-100"
+                      title="Download a full backup of your brain"
+                    >
+                      Backup
+                    </button>
+                  )}
                   <button
                     onClick={handleLogout}
                     className="rounded px-2 py-0.5 text-indigo-600 hover:bg-indigo-100"
@@ -1867,6 +1957,14 @@ export default function App() {
                 <p className="font-medium text-indigo-700">
                   🔒 Sign in to use your shared brain (rules, learning, history)
                 </p>
+                <input
+                  value={loginUser}
+                  onChange={(e) => setLoginUser(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                  placeholder="Username"
+                  autoComplete="username"
+                  className="w-full rounded border border-indigo-200 px-2 py-1"
+                />
                 <div className="flex gap-1.5">
                   <input
                     type="password"
@@ -1874,6 +1972,7 @@ export default function App() {
                     onChange={(e) => setLoginPassword(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && handleLogin()}
                     placeholder="Password"
+                    autoComplete="current-password"
                     className="min-w-0 flex-1 rounded border border-indigo-200 px-2 py-1"
                   />
                   <button
@@ -1884,6 +1983,12 @@ export default function App() {
                     {loggingIn ? "…" : "Sign in"}
                   </button>
                 </div>
+                {googleAvailable && (
+                  <div className="flex flex-col items-center gap-1 pt-1">
+                    <span className="text-[10px] text-gray-400">— or —</span>
+                    <div ref={googleBtnRef} />
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1985,13 +2090,15 @@ export default function App() {
                       {Math.round((r.chars || 0) / 1000) + "k chars"}
                     </p>
                   </div>
-                  <button
-                    onClick={() => handleDeleteRule(r.id)}
-                    className="shrink-0 rounded px-1 text-gray-400 hover:bg-red-50 hover:text-red-500"
-                    title="Remove rule"
-                  >
-                    ×
-                  </button>
+                  {isAdmin && (
+                    <button
+                      onClick={() => handleDeleteRule(r.id)}
+                      className="shrink-0 rounded px-1 text-gray-400 hover:bg-red-50 hover:text-red-500"
+                      title="Remove rule (admin)"
+                    >
+                      ×
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>

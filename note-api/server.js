@@ -33,6 +33,7 @@
 const express = require("express");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
+const https = require("https");
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
@@ -47,10 +48,35 @@ const DISABLE_TOOLS = process.env.CLAUDE_DISABLE_TOOLS !== "0";
 const EXTRA_ARGS = (process.env.CLAUDE_EXTRA_ARGS || "").split(" ").filter(Boolean);
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "120000", 10);
 
+// --- accounts ---
+// Built-in users (override with a USERS env var: JSON array of
+// {username,password,role}). Roles: "admin" (full control incl. deleting rules
+// and downloading backups) or "general" (use everything, contribute rules &
+// learning, but not delete the shared library or export it).
+const DEFAULT_USERS = [
+  { username: "vikash", password: "vikash", role: "general" },
+  { username: "admin", password: "admin1", role: "admin" },
+];
+let USERS = DEFAULT_USERS;
+try { if (process.env.USERS) USERS = JSON.parse(process.env.USERS); } catch (_) {}
+// Optional legacy single password -> admin login.
 const APP_PASSWORD = process.env.APP_PASSWORD || "";
 const APP_SECRET =
   process.env.APP_SECRET ||
-  crypto.createHash("sha256").update("csir-note::" + (APP_PASSWORD || "open")).digest("hex");
+  crypto
+    .createHash("sha256")
+    .update(
+      "csir-note::" +
+        USERS.map((u) => u.username + ":" + u.password + ":" + u.role).join("|") +
+        "::" + APP_PASSWORD
+    )
+    .digest("hex");
+// Google sign-in (general users). Set GOOGLE_CLIENT_ID to enable; optionally
+// restrict to GOOGLE_ALLOWED_EMAILS (comma-separated). Empty allowlist means any
+// Google account with a verified email is accepted as a general user.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_ALLOWED_EMAILS = (process.env.GOOGLE_ALLOWED_EMAILS || "")
+  .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 
 // Neutral, empty working dir so /generate has no project/code to "look at".
 const NEUTRAL_CWD =
@@ -126,25 +152,66 @@ function searchRules(q, limit) {
 /* ------------------------------------------------------------------ *
  *  Auth (single-user password -> stateless HMAC token)
  * ------------------------------------------------------------------ */
-function signToken() {
-  const payload = "v1." + Date.now();
+function signToken(user) {
+  const body = Buffer.from(
+    JSON.stringify({ u: user.username, r: user.role, t: Date.now() })
+  ).toString("base64url");
+  const payload = "v2." + body;
   const sig = crypto.createHmac("sha256", APP_SECRET).update(payload).digest("hex");
   return payload + "." + sig;
 }
 function verifyToken(tok) {
   const parts = String(tok || "").split(".");
-  if (parts.length !== 3) return false;
+  if (parts.length !== 3 || parts[0] !== "v2") return null;
   const payload = parts[0] + "." + parts[1];
   const expect = crypto.createHmac("sha256", APP_SECRET).update(payload).digest("hex");
   const a = Buffer.from(parts[2]); const b = Buffer.from(expect);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const d = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return { username: d.u, role: d.r || "general" };
+  } catch (_) { return null; }
 }
 function requireAuth(req, res, next) {
-  if (!APP_PASSWORD) return next(); // not configured -> open (set APP_PASSWORD to lock)
   const h = req.headers.authorization || "";
   const tok = h.indexOf("Bearer ") === 0 ? h.slice(7) : "";
-  if (verifyToken(tok)) return next();
-  return res.status(401).json({ error: "unauthorized" });
+  const u = verifyToken(tok);
+  if (!u) return res.status(401).json({ error: "unauthorized" });
+  req.user = u;
+  next();
+}
+function requireAdmin(req, res, next) {
+  requireAuth(req, res, () => {
+    if (req.user && req.user.role === "admin") return next();
+    return res.status(403).json({ error: "admin only" });
+  });
+}
+
+/* Verify a Google ID token via Google's tokeninfo endpoint (no extra deps). */
+function httpsGetJson(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (r) => {
+        let d = "";
+        r.on("data", (c) => (d += c));
+        r.on("end", () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
+      })
+      .on("error", reject);
+  });
+}
+async function verifyGoogleCredential(credential) {
+  if (!GOOGLE_CLIENT_ID) throw new Error("google sign-in not configured");
+  const info = await httpsGetJson(
+    "https://oauth2.googleapis.com/tokeninfo?id_token=" + encodeURIComponent(credential)
+  );
+  if (!info || info.error || info.error_description) throw new Error("invalid google token");
+  if (info.aud !== GOOGLE_CLIENT_ID) throw new Error("google token audience mismatch");
+  const verified = info.email_verified === true || info.email_verified === "true";
+  if (!info.email || !verified) throw new Error("google email not verified");
+  const email = String(info.email).toLowerCase();
+  if (GOOGLE_ALLOWED_EMAILS.length && GOOGLE_ALLOWED_EMAILS.indexOf(email) === -1)
+    throw new Error("this Google account is not allowed");
+  return email;
 }
 
 /* ------------------------------------------------------------------ *
@@ -204,7 +271,8 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, hasPassword: !!APP_PASSWORD }));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, users: USERS.length, google: !!GOOGLE_CLIENT_ID }));
 
 // --- generation (unchanged behaviour) ---
 app.post("/generate", async (req, res) => {
@@ -272,10 +340,43 @@ app.post("/extract", requireAuth, async (req, res) => {
 });
 
 // --- auth ---
+app.get("/auth/config", (_req, res) => {
+  res.json({
+    google: !!GOOGLE_CLIENT_ID,
+    googleClientId: GOOGLE_CLIENT_ID,
+    usersEnabled: USERS.length > 0,
+  });
+});
+
 app.post("/login", (req, res) => {
-  const pw = (req.body && req.body.password) || "";
-  if (APP_PASSWORD && pw !== APP_PASSWORD) return res.status(401).json({ error: "wrong password" });
-  res.json({ token: signToken() });
+  const b = req.body || {};
+  const username = String(b.username || "").trim();
+  const password = String(b.password || "");
+  if (username) {
+    const u = USERS.find(
+      (x) => x.username.toLowerCase() === username.toLowerCase() && x.password === password
+    );
+    if (!u) return res.status(401).json({ error: "wrong username or password" });
+    return res.json({ token: signToken(u), user: { username: u.username, role: u.role } });
+  }
+  // legacy password-only -> admin
+  if (APP_PASSWORD && password === APP_PASSWORD) {
+    const u = { username: "admin", role: "admin" };
+    return res.json({ token: signToken(u), user: u });
+  }
+  return res.status(401).json({ error: "wrong username or password" });
+});
+
+app.post("/login/google", async (req, res) => {
+  try {
+    const credential = (req.body && req.body.credential) || "";
+    if (!credential) return res.status(400).json({ error: "missing credential" });
+    const email = await verifyGoogleCredential(credential);
+    const u = { username: email, role: "general" };
+    res.json({ token: signToken(u), user: u });
+  } catch (e) {
+    res.status(401).json({ error: String((e && e.message) || e) });
+  }
 });
 
 // --- brain: read everything (rule full text trimmed out of the list) ---
@@ -330,7 +431,7 @@ app.post("/brain/rule", requireAuth, (req, res) => {
   brain.rules.push(item); saveBrain();
   res.json({ id: item.id, name: item.name, addedAt: item.addedAt, sectionCount: sections.length, chars: item.chars });
 });
-app.delete("/brain/rule/:id", requireAuth, (req, res) => {
+app.delete("/brain/rule/:id", requireAdmin, (req, res) => {
   brain.rules = brain.rules.filter((x) => x.id !== req.params.id);
   saveBrain(); res.json({ ok: true });
 });
@@ -350,8 +451,8 @@ app.post("/brain/note", requireAuth, (req, res) => {
   saveBrain(); res.json(item);
 });
 
-// full backup
-app.get("/backup", requireAuth, (_req, res) => {
+// full backup (admin only)
+app.get("/backup", requireAdmin, (_req, res) => {
   res.setHeader("Content-Disposition", 'attachment; filename="note-brain-backup.json"');
   res.json(brain);
 });
@@ -359,7 +460,8 @@ app.get("/backup", requireAuth, (_req, res) => {
 app.listen(PORT, () => {
   console.log(
     "csir-note-api listening on :" + PORT +
-    " (origin: " + ALLOWED_ORIGIN + ", auth: " + (APP_PASSWORD ? "on" : "OPEN") +
+    " (origin: " + ALLOWED_ORIGIN + ", users: " + USERS.length +
+    ", google: " + (GOOGLE_CLIENT_ID ? "on" : "off") +
     ", data: " + DATA_DIR + ")"
   );
 });
