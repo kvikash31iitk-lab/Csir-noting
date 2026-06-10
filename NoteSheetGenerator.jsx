@@ -27,6 +27,10 @@ const CLAUDE_MAX_TOKENS = 2000;
 const MAMMOTH_CDN =
   "https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js";
 const DOCX_CDN = "https://unpkg.com/docx@8.5.0/build/index.umd.js";
+const PDFJS_CDN =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+const PDFJS_WORKER_CDN =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 const SEED_PATTERNS = {
   toneRules: [
@@ -221,7 +225,46 @@ function loadScript(src) {
   return scriptCache[src];
 }
 
-/** Read .docx (mammoth) or .pdf / text (FileReader) into raw text. */
+/* Extract the text layer of a PDF. Primary path uses PDF.js, which properly
+ * decompresses content streams (the common FlateDecode case). Falls back to a
+ * crude raw-byte scrape only if PDF.js cannot be loaded (e.g. offline). */
+async function extractPdfText(file) {
+  try {
+    await loadScript(PDFJS_CDN);
+    const pdfjs = window.pdfjsLib;
+    if (pdfjs) {
+      try {
+        pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_CDN;
+      } catch {}
+      const data = await file.arrayBuffer();
+      const pdf = await pdfjs.getDocument({ data }).promise;
+      let out = "";
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        out += content.items.map((it) => it.str || "").join(" ") + "\n";
+      }
+      return out.replace(/[ \t]+/g, " ").trim();
+    }
+  } catch {
+    /* fall through to the crude fallback */
+  }
+  // Fallback: scrape parenthesised strings from raw bytes (uncompressed PDFs only).
+  const raw = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("read fail"));
+    reader.readAsText(file);
+  });
+  const matches = raw.match(/\(([^()]{2,})\)/g) || [];
+  return matches
+    .map((m) => m.slice(1, -1))
+    .join(" ")
+    .replace(/\\[rn]/g, " ")
+    .trim();
+}
+
+/** Read .docx (mammoth) or .pdf (PDF.js) or text (FileReader) into raw text. */
 async function readFileAsText(file) {
   const name = (file.name || "").toLowerCase();
   if (name.endsWith(".docx")) {
@@ -231,23 +274,21 @@ async function readFileAsText(file) {
     const result = await window.mammoth.extractRawText({ arrayBuffer });
     return (result && result.value) || "";
   }
-  // .pdf (text layer only) and any other file -> read as text
+  if (name.endsWith(".pdf")) {
+    const text = await extractPdfText(file);
+    // A scanned / image-only PDF has no text layer, so almost nothing comes
+    // out. Flag it instead of silently feeding the AI an empty document.
+    if (text.replace(/\s/g, "").length < 20) {
+      const err = new Error("PDF_NO_TEXT");
+      err.code = "PDF_NO_TEXT";
+      throw err;
+    }
+    return text;
+  }
+  // any other file -> read as plain text
   return await new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => {
-      let txt = reader.result || "";
-      if (name.endsWith(".pdf")) {
-        // crude text-layer extraction from raw pdf bytes
-        const matches = String(txt).match(/\(([^()]{2,})\)/g) || [];
-        const extracted = matches
-          .map((m) => m.slice(1, -1))
-          .join(" ")
-          .replace(/\\[rn]/g, " ")
-          .trim();
-        if (extracted) txt = extracted;
-      }
-      resolve(String(txt));
-    };
+    reader.onload = () => resolve(String(reader.result || ""));
     reader.onerror = () => reject(new Error("read fail"));
     reader.readAsText(file);
   });
@@ -504,7 +545,9 @@ export default function App() {
     } catch (e) {
       setKnowledgeFileLoading(false);
       showToast(
-        "Could not read this file. Please try a different .docx or .pdf file.",
+        e && e.code === "PDF_NO_TEXT"
+          ? "This PDF has no readable text (it looks scanned/image-only). Please upload a .docx or a text-based PDF."
+          : "Could not read this file. Please try a different .docx or .pdf file.",
         "error"
       );
       return;
@@ -611,7 +654,9 @@ export default function App() {
     } catch (e) {
       setRefLoading(false);
       showToast(
-        "Could not read this file. Please try a different .docx or .pdf file.",
+        e && e.code === "PDF_NO_TEXT"
+          ? "This PDF has no readable text (it looks scanned/image-only). Please upload a .docx or a text-based PDF."
+          : "Could not read this file. Please try a different .docx or .pdf file.",
         "error"
       );
       return false;
@@ -810,7 +855,9 @@ export default function App() {
       setSourceProcessing(false);
       setSourceFilename("");
       showToast(
-        "Could not read this file. Please try a different .docx or .pdf file.",
+        e && e.code === "PDF_NO_TEXT"
+          ? "This PDF has no readable text (it looks scanned/image-only). Please upload a .docx or a text-based PDF."
+          : "Could not read this file. Please try a different .docx or .pdf file.",
         "error"
       );
       return;
