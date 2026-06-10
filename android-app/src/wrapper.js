@@ -67,6 +67,18 @@
     } catch (e) {}
   }
 
+  /* On first run, default to the subscription backend so the app works out of
+   * the box (no manual settings). Seeded only once, so a user who later
+   * switches to demo or an API key keeps their choice. */
+  try {
+    if (localStorage.getItem("cfg::seeded") !== "1") {
+      if (!getBackend() && !getKey()) {
+        setBackend("https://noteapi.cheetsheet.tech/generate");
+      }
+      localStorage.setItem("cfg::seeded", "1");
+    }
+  } catch (e) {}
+
   /* ---------------- demo responses ---------------- */
   function delay(ms) {
     return new Promise(function (r) {
