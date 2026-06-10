@@ -31,6 +31,16 @@ const PDFJS_CDN =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
 const PDFJS_WORKER_CDN =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const XLSX_CDN =
+  "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
+const TESSERACT_CDN =
+  "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+// Bilingual OCR (English + Hindi) for CSIR notings. Language data is fetched
+// once by tesseract.js and cached in the browser thereafter.
+const OCR_LANGS = "eng+hin";
+// Accept string shared by every upload control — "anything" in.
+const UPLOAD_ACCEPT =
+  ".docx,.pdf,.xlsx,.xls,.csv,.txt,.png,.jpg,.jpeg,.webp,.bmp,.tiff,.tif";
 
 const SEED_PATTERNS = {
   toneRules: [
@@ -264,9 +274,85 @@ async function extractPdfText(file) {
     .trim();
 }
 
-/** Read .docx (mammoth) or .pdf (PDF.js) or text (FileReader) into raw text. */
-async function readFileAsText(file) {
+/* Read a spreadsheet (.xlsx/.xls/.csv) into labelled CSV text, one block per
+ * sheet, so the AI sees the tabular data clearly. */
+async function readSpreadsheet(file) {
+  await loadScript(XLSX_CDN);
+  if (!window.XLSX) throw new Error("xlsx unavailable");
+  const data = await file.arrayBuffer();
+  const wb = window.XLSX.read(data, { type: "array" });
+  let out = "";
+  (wb.SheetNames || []).forEach((sn) => {
+    const ws = wb.Sheets[sn];
+    if (!ws) return;
+    const csv = window.XLSX.utils.sheet_to_csv(ws, { blankrows: false });
+    if (csv && csv.trim()) out += "# Sheet: " + sn + "\n" + csv.trim() + "\n\n";
+  });
+  return out.trim();
+}
+
+/* Local OCR via tesseract.js. Handles image files directly and scanned PDFs by
+ * rendering each page to a canvas first (PDF.js). Used as the fallback OCR
+ * engine; Claude vision is the primary path (added separately). */
+async function ocrWithTesseract(file, onStatus) {
+  await loadScript(TESSERACT_CDN);
+  if (!window.Tesseract) throw new Error("ocr unavailable");
   const name = (file.name || "").toLowerCase();
+  const note = (m) => {
+    if (typeof onStatus === "function") onStatus(m);
+  };
+
+  if (name.endsWith(".pdf")) {
+    await loadScript(PDFJS_CDN);
+    const pdfjs = window.pdfjsLib;
+    if (!pdfjs) throw new Error("pdf renderer unavailable");
+    try {
+      pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_CDN;
+    } catch {}
+    const data = await file.arrayBuffer();
+    const pdf = await pdfjs.getDocument({ data }).promise;
+    const maxPages = Math.min(pdf.numPages, 20); // safety cap
+    let out = "";
+    for (let i = 1; i <= maxPages; i++) {
+      note("Reading scanned page " + i + " of " + maxPages + "…");
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 2 });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      const res = await window.Tesseract.recognize(canvas, OCR_LANGS);
+      out += ((res && res.data && res.data.text) || "") + "\n";
+    }
+    return out.trim();
+  }
+
+  // single image
+  note("Reading scanned image…");
+  const res = await window.Tesseract.recognize(file, OCR_LANGS);
+  return ((res && res.data && res.data.text) || "").trim();
+}
+
+/* OCR dispatcher. Claude vision (the better engine for Hindi / messy govt
+ * scans) is the primary path; tesseract.js is the local fallback. The Claude
+ * path is wired in a later step, so for now this resolves to Tesseract. */
+async function ocrFile(file, onStatus) {
+  return await ocrWithTesseract(file, onStatus);
+}
+
+/* Read ANY supported reference into plain text:
+ *   .docx -> mammoth   .xlsx/.xls/.csv -> SheetJS
+ *   .pdf  -> PDF.js text layer, falling back to OCR when it's a scan
+ *   images -> OCR      anything else -> plain text
+ * onStatus(msg) is an optional progress callback for slow OCR work. */
+async function readFileAsText(file, onStatus) {
+  const name = (file.name || "").toLowerCase();
+  const type = (file.type || "").toLowerCase();
+  const isImage =
+    type.indexOf("image/") === 0 ||
+    /\.(png|jpe?g|webp|gif|bmp|tiff?)$/.test(name);
+
   if (name.endsWith(".docx")) {
     await loadScript(MAMMOTH_CDN);
     if (!window.mammoth) throw new Error("mammoth unavailable");
@@ -274,17 +360,40 @@ async function readFileAsText(file) {
     const result = await window.mammoth.extractRawText({ arrayBuffer });
     return (result && result.value) || "";
   }
+
+  if (/\.(xlsx|xls|csv)$/.test(name)) {
+    return await readSpreadsheet(file);
+  }
+
   if (name.endsWith(".pdf")) {
     const text = await extractPdfText(file);
-    // A scanned / image-only PDF has no text layer, so almost nothing comes
-    // out. Flag it instead of silently feeding the AI an empty document.
-    if (text.replace(/\s/g, "").length < 20) {
-      const err = new Error("PDF_NO_TEXT");
-      err.code = "PDF_NO_TEXT";
-      throw err;
+    if (text.replace(/\s/g, "").length >= 20) return text;
+    // No usable text layer -> it's a scan. OCR it.
+    let ocr = "";
+    try {
+      ocr = await ocrFile(file, onStatus);
+    } catch {
+      ocr = "";
     }
-    return text;
+    if (ocr.replace(/\s/g, "").length >= 20) return ocr;
+    const err = new Error("PDF_NO_TEXT");
+    err.code = "PDF_NO_TEXT";
+    throw err;
   }
+
+  if (isImage) {
+    let ocr = "";
+    try {
+      ocr = await ocrFile(file, onStatus);
+    } catch {
+      ocr = "";
+    }
+    if (ocr.replace(/\s/g, "").length >= 5) return ocr;
+    const err = new Error("IMAGE_NO_TEXT");
+    err.code = "IMAGE_NO_TEXT";
+    throw err;
+  }
+
   // any other file -> read as plain text
   return await new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -541,12 +650,12 @@ export default function App() {
     setKnowledgeFileLoading(true);
     let rawText = "";
     try {
-      rawText = await readFileAsText(file);
+      rawText = await readFileAsText(file, (m) => showToast(m, "info"));
     } catch (e) {
       setKnowledgeFileLoading(false);
       showToast(
-        e && e.code === "PDF_NO_TEXT"
-          ? "This PDF has no readable text (it looks scanned/image-only). Please upload a .docx or a text-based PDF."
+        e && (e.code === "PDF_NO_TEXT" || e.code === "IMAGE_NO_TEXT")
+          ? "Couldn't read any text from this scan/image. Try a clearer scan, or upload the .docx (or text-based PDF) version."
           : "Could not read this file. Please try a different .docx or .pdf file.",
         "error"
       );
@@ -650,12 +759,12 @@ export default function App() {
     setRefLoading(true);
     let rawText = "";
     try {
-      rawText = await readFileAsText(file);
+      rawText = await readFileAsText(file, (m) => showToast(m, "info"));
     } catch (e) {
       setRefLoading(false);
       showToast(
-        e && e.code === "PDF_NO_TEXT"
-          ? "This PDF has no readable text (it looks scanned/image-only). Please upload a .docx or a text-based PDF."
+        e && (e.code === "PDF_NO_TEXT" || e.code === "IMAGE_NO_TEXT")
+          ? "Couldn't read any text from this scan/image. Try a clearer scan, or upload the .docx (or text-based PDF) version."
           : "Could not read this file. Please try a different .docx or .pdf file.",
         "error"
       );
@@ -850,13 +959,13 @@ export default function App() {
     setSourceFilename(file.name);
     let rawText = "";
     try {
-      rawText = await readFileAsText(file);
+      rawText = await readFileAsText(file, (m) => showToast(m, "info"));
     } catch (e) {
       setSourceProcessing(false);
       setSourceFilename("");
       showToast(
-        e && e.code === "PDF_NO_TEXT"
-          ? "This PDF has no readable text (it looks scanned/image-only). Please upload a .docx or a text-based PDF."
+        e && (e.code === "PDF_NO_TEXT" || e.code === "IMAGE_NO_TEXT")
+          ? "Couldn't read any text from this scan/image. Try a clearer scan, or upload the .docx (or text-based PDF) version."
           : "Could not read this file. Please try a different .docx or .pdf file.",
         "error"
       );
@@ -1429,7 +1538,7 @@ export default function App() {
           <input
             ref={refFileInput}
             type="file"
-            accept=".docx,.pdf"
+            accept={UPLOAD_ACCEPT}
             multiple
             className="hidden"
             onChange={(e) => {
@@ -1447,7 +1556,7 @@ export default function App() {
             {refLoading ? "Processing…" : "+ Add Reference Noting(s)"}
           </button>
           <p className="mt-1 text-[10px] text-gray-400">
-            You can select several .docx / .pdf files at once.
+            Select one or more — Word, PDF, Excel, or scanned images.
           </p>
         </div>
 
@@ -1521,7 +1630,7 @@ export default function App() {
           <input
             ref={knowledgeFileInput}
             type="file"
-            accept=".docx,.pdf"
+            accept={UPLOAD_ACCEPT}
             className="hidden"
             onChange={(e) => {
               const f = e.target.files && e.target.files[0];
@@ -1662,7 +1771,7 @@ export default function App() {
             >
               <input
                 type="file"
-                accept=".docx,.pdf"
+                accept={UPLOAD_ACCEPT}
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files && e.target.files[0];
@@ -1680,7 +1789,9 @@ export default function App() {
                   <span className="mt-1 text-xs text-gray-500">
                     Drag &amp; drop or click to upload
                   </span>
-                  <span className="text-[10px] text-gray-400">.docx / .pdf</span>
+                  <span className="text-[10px] text-gray-400">
+                    Word · PDF · Excel · scanned image
+                  </span>
                 </>
               )}
             </label>
