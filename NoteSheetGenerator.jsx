@@ -278,6 +278,7 @@ const api = {
   searchRules: (q, k) =>
     apiFetch("/brain/rules/search?q=" + encodeURIComponent(q) + "&k=" + (k || 6)),
   addNote: (n) => apiFetch("/brain/note", { method: "POST", body: JSON.stringify(n) }),
+  backup: () => apiFetch("/backup"),
   extract: (payload) =>
     apiFetch("/extract", { method: "POST", body: JSON.stringify(payload) }),
 };
@@ -594,6 +595,18 @@ export default function App() {
   const [signatures, setSignatures] = useState([]); // [{chain, label}]
   const [refLoading, setRefLoading] = useState(false);
 
+  /* ----- rule library (GFR / CCS / ... stored server-side) ----- */
+  const [rules, setRules] = useState([]); // [{id, name, addedAt, sectionCount, chars}]
+  const [ruleLoading, setRuleLoading] = useState(false);
+  const [ruleHits, setRuleHits] = useState([]); // rule sections used by the last generation
+
+  /* ----- cloud login (server-side brain) ----- */
+  const [cloudOn, setCloudOn] = useState(!!apiBase());
+  const [loggedIn, setLoggedIn] = useState(!!apiToken());
+  const [showLogin, setShowLogin] = useState(false);
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
+
   /* ----- permanent learning material (typed/pasted knowledge) ----- */
   const [knowledge, setKnowledge] = useState([]); // [{id, text, addedAt, source?}]
   const [knowledgeInput, setKnowledgeInput] = useState("");
@@ -653,6 +666,7 @@ export default function App() {
   }, []);
   const refFileInput = useRef(null);
   const knowledgeFileInput = useRef(null);
+  const ruleFileInput = useRef(null);
 
   /* ============================================================== *
    *  MOUNT: load CDN libs, seed baseline, load library + session
@@ -686,6 +700,8 @@ export default function App() {
       } catch (e) {
         showToast("Storage error — changes may not persist", "error");
       }
+      // ---- cloud brain (server-side memory: rules + shared learning) ----
+      if (apiBase()) await refreshCloud();
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -714,6 +730,130 @@ export default function App() {
     }
   }
 
+  /* ============================================================== *
+   *  CLOUD BRAIN (server-side memory: rule library + shared learning)
+   * ============================================================== */
+  async function refreshCloud() {
+    if (!apiBase()) {
+      setCloudOn(false);
+      return;
+    }
+    setCloudOn(true);
+    try {
+      const brain = await api.getBrain();
+      setLoggedIn(true);
+      setShowLogin(false);
+      setRules(Array.isArray(brain.rules) ? brain.rules : []);
+      // Re-merge standing instructions now that we're authed.
+      await refreshKnowledge();
+    } catch (e) {
+      if (e && e.code === "UNAUTHORIZED") {
+        setLoggedIn(false);
+        setShowLogin(true);
+      }
+      // any other error: leave cloud features dormant, app still works locally
+    }
+  }
+
+  async function handleLogin() {
+    const pw = loginPassword.trim();
+    if (!pw) {
+      showToast("Enter your password", "error");
+      return;
+    }
+    setLoggingIn(true);
+    try {
+      const { token } = await api.login(pw);
+      setApiToken(token);
+      setLoginPassword("");
+      setLoggedIn(true);
+      setShowLogin(false);
+      await refreshCloud();
+      showToast("Signed in to your brain ✓", "success");
+    } catch (e) {
+      showToast(
+        e && e.message === "wrong password"
+          ? "Wrong password"
+          : "Sign-in failed — check the backend URL in settings",
+        "error"
+      );
+    } finally {
+      setLoggingIn(false);
+    }
+  }
+
+  function handleLogout() {
+    setApiToken("");
+    setLoggedIn(false);
+    setRules([]);
+    showToast("Signed out", "info");
+  }
+
+  async function handleBackup() {
+    try {
+      const data = await api.backup();
+      const blob = new Blob([JSON.stringify(data, null, 2)], {
+        type: "application/json",
+      });
+      triggerDownload(
+        blob,
+        "note-brain-backup-" + new Date().toISOString().slice(0, 10) + ".json"
+      );
+      showToast("Brain backup downloaded ✓", "success");
+    } catch (e) {
+      showToast("Backup failed", "error");
+    }
+  }
+
+  /* Upload a rulebook (GFR / CCS / ...) -> extract text -> store + index on the
+   * server so every future note can cite it. */
+  async function handleRuleUpload(file) {
+    if (!file) return;
+    if (!apiBase()) {
+      showToast("Set the backend URL in settings first", "error");
+      return;
+    }
+    setRuleLoading(true);
+    let rawText = "";
+    try {
+      rawText = await readFileAsText(file, (m) => showToast(m, "info"));
+    } catch (e) {
+      setRuleLoading(false);
+      showToast(
+        e && (e.code === "PDF_NO_TEXT" || e.code === "IMAGE_NO_TEXT")
+          ? "Couldn't read text from this rule file. Try a .docx or text-based PDF."
+          : "Could not read this file.",
+        "error"
+      );
+      return;
+    }
+    try {
+      const name = (file.name || "Rule document").replace(/\.[^.]+$/, "");
+      const saved = await api.addRule(name, rawText);
+      setRules((r) => [...r, saved]);
+      showToast("Rule added to the brain ✓ (" + (saved.sectionCount || 0) + " sections)", "success");
+    } catch (e) {
+      if (e && e.code === "UNAUTHORIZED") {
+        setShowLogin(true);
+        showToast("Please sign in to add rules", "error");
+      } else {
+        showToast("Could not save rule: " + (e && e.message), "error");
+      }
+    } finally {
+      setRuleLoading(false);
+    }
+  }
+
+  async function handleDeleteRule(id) {
+    try {
+      await api.delRule(id);
+      setRules((r) => r.filter((x) => x.id !== id));
+      showToast("Rule removed", "info");
+    } catch (e) {
+      showToast("Could not remove rule", "error");
+    }
+  }
+
   async function refreshSignatures() {
     const sigs = await storageGet("lib:signatures", true);
     if (Array.isArray(sigs)) setSignatures(sigs);
@@ -721,7 +861,42 @@ export default function App() {
 
   async function refreshKnowledge() {
     const k = await storageGet("lib:knowledge", true);
-    setKnowledge(Array.isArray(k) ? k : []);
+    let list = Array.isArray(k) ? k : [];
+    // When signed in, merge in the server-side standing instructions so they
+    // show on every device (deduped by id).
+    if (apiBase() && apiToken()) {
+      try {
+        const brain = await api.getBrain();
+        const seen = new Set(list.map((x) => x.id));
+        const cloud = (brain.learning || [])
+          .filter((x) => !seen.has(x.id))
+          .map((x) => ({ id: x.id, text: x.text, addedAt: x.addedAt, cloud: true }));
+        list = [...cloud, ...list];
+      } catch (e) {
+        /* offline / not authed: show local only */
+      }
+    }
+    setKnowledge(list);
+  }
+
+  // Persist a standing instruction. When signed in it goes to the server (so it
+  // follows the user across devices); a local mirror is always kept too.
+  async function persistLearning(text, extra) {
+    let item = Object.assign({ id: generateUUID(), text, addedAt: Date.now() }, extra || {});
+    if (apiBase() && apiToken()) {
+      try {
+        const saved = await api.addLearning(text);
+        item = Object.assign({}, item, {
+          id: saved.id, text: saved.text, addedAt: saved.addedAt, cloud: true,
+        });
+      } catch (e) {
+        /* fall back to local-only */
+      }
+    }
+    const list = (await storageGet("lib:knowledge", true)) || [];
+    list.push(item);
+    await storageSet("lib:knowledge", list, true);
+    return item;
   }
 
   async function addKnowledge() {
@@ -729,13 +904,10 @@ export default function App() {
     if (!text) return;
     setSavingKnowledge(true);
     try {
-      const list = (await storageGet("lib:knowledge", true)) || [];
-      list.push({ id: generateUUID(), text, addedAt: Date.now() });
-      const ok = await storageSet("lib:knowledge", list, true);
-      if (!ok) throw new Error("storage");
+      const item = await persistLearning(text);
       await refreshKnowledge();
       setKnowledgeInput("");
-      showToast("Learning material saved ✓", "success");
+      showToast(item.cloud ? "Learning saved to your brain ☁️" : "Learning material saved ✓", "success");
     } catch (e) {
       showToast("Storage error — changes may not persist", "error");
     } finally {
@@ -774,18 +946,10 @@ export default function App() {
     }
 
     try {
-      const list = (await storageGet("lib:knowledge", true)) || [];
       const text = learnings
         ? "From " + file.name + ":\n• " + learnings.join("\n• ")
         : "From " + file.name + ":\n" + rawText.slice(0, 4000);
-      list.push({
-        id: generateUUID(),
-        text,
-        addedAt: Date.now(),
-        source: file.name,
-      });
-      const ok = await storageSet("lib:knowledge", list, true);
-      if (!ok) throw new Error("storage");
+      await persistLearning(text, { source: file.name });
       await refreshKnowledge();
       showToast(
         learnings
@@ -803,8 +967,12 @@ export default function App() {
   async function deleteKnowledge(id) {
     try {
       const list = (await storageGet("lib:knowledge", true)) || [];
+      const item = list.find((k) => k.id === id) || knowledge.find((k) => k.id === id);
       const next = list.filter((k) => k.id !== id);
       await storageSet("lib:knowledge", next, true);
+      if (apiBase() && apiToken() && (!item || item.cloud)) {
+        try { await api.delLearning(id); } catch (e) {}
+      }
       await refreshKnowledge();
       showToast("Learning note removed", "info");
     } catch (e) {
@@ -1155,10 +1323,35 @@ export default function App() {
     setFacts((f) => ({ ...(f || {}), [key]: value }));
   }
 
+  /* Retrieve the rule provisions most relevant to what's being drafted, from
+   * the server-side rule library, and format them as authoritative grounding.
+   * Also records them in ruleHits so the UI can show "rules used". */
+  async function retrieveRuleContext(queryText) {
+    setRuleHits([]);
+    if (!apiBase() || !queryText || !queryText.trim()) return "";
+    try {
+      const out = await api.searchRules(queryText, 6);
+      const results = (out && out.results) || [];
+      if (!results.length) return "";
+      setRuleHits(results);
+      const blocks = results.map(
+        (r, i) =>
+          "[" + (i + 1) + "] " + (r.ruleName || "Rule") +
+          (r.label ? " — " + r.label : "") + ":\n" + r.text
+      );
+      return (
+        ". The following official rule provisions were retrieved from the office rule library and are AUTHORITATIVE. When the note relies on a rule, cite it EXACTLY as written here (e.g. 'GFR 2017 Rule 21') and never invent rule numbers. If none are relevant, do not cite any. Provisions:\n" +
+        blocks.join("\n\n")
+      );
+    } catch (e) {
+      return ""; // retrieval is best-effort; never block generation
+    }
+  }
+
   /* ============================================================== *
    *  STYLE-PATTERN INJECTION (shared by generation + iteration)
    * ============================================================== */
-  async function buildSystemPrompt() {
+  async function buildSystemPrompt(ruleContext) {
     const patterns = (await storageGet("lib:patterns", true)) || SEED_PATTERNS;
     const sigs = (await storageGet("lib:signatures", true)) || SEED_SIGNATURES;
     const knowledgeList = (await storageGet("lib:knowledge", true)) || [];
@@ -1174,6 +1367,7 @@ export default function App() {
         ? ". You must always follow these standing instructions and permanent learning material provided by the office: " +
           JSON.stringify(knowledgeText)
         : "") +
+      (ruleContext ? ruleContext : "") +
       ". Return only raw JSON with no markdown, no backticks, no preamble, using this exact structure:\n" +
       "{\n" +
       "  header: organization header string,\n" +
@@ -1227,13 +1421,16 @@ export default function App() {
     }
     setGenerating(true);
     try {
-      const sys = await buildSystemPrompt();
       const chain =
         signatures[selectedChainIdx] && signatures[selectedChainIdx].chain
           ? signatures[selectedChainIdx].chain
           : [];
       const instruction =
         chatInput.trim() || "Generate a noting";
+      const ruleContext = await retrieveRuleContext(
+        instruction + " " + (facts ? JSON.stringify(facts) : "")
+      );
+      const sys = await buildSystemPrompt(ruleContext);
       const userMsg = facts
         ? "Create a formal noting based on these verified facts: " +
           JSON.stringify(facts) +
@@ -1280,6 +1477,16 @@ export default function App() {
         activeVersion: 0,
         chatHistory: newChat,
       });
+      // Record in server-side history (best-effort, for audit + future learning).
+      if (apiBase() && apiToken()) {
+        api
+          .addNote({
+            title: note.subject || "",
+            instructions: instruction,
+            draft: JSON.stringify(note),
+          })
+          .catch(() => {});
+      }
     } catch (e) {
       showToast("AI call failed — please retry", "error");
     } finally {
@@ -1307,7 +1514,8 @@ export default function App() {
     setAiTyping(true);
 
     try {
-      const sys = await buildSystemPrompt();
+      const ruleContext = await retrieveRuleContext(msg);
+      const sys = await buildSystemPrompt(ruleContext);
       const current = versions[activeVersion];
       const n = versions.length;
       const priorInstructions = chatHistory
@@ -1596,6 +1804,57 @@ export default function App() {
       >
         <h2 className="mb-3 text-lg font-bold">📚 Library</h2>
 
+        {/* Cloud brain status / login */}
+        {cloudOn && (
+          <div className="mb-3 rounded-lg border border-indigo-200 bg-indigo-50 p-2 text-xs">
+            {loggedIn ? (
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-indigo-700">
+                  ☁️ Brain connected — syncs across devices
+                </span>
+                <span className="flex shrink-0 gap-1">
+                  <button
+                    onClick={handleBackup}
+                    className="rounded px-2 py-0.5 text-indigo-600 hover:bg-indigo-100"
+                    title="Download a full backup of your brain"
+                  >
+                    Backup
+                  </button>
+                  <button
+                    onClick={handleLogout}
+                    className="rounded px-2 py-0.5 text-indigo-600 hover:bg-indigo-100"
+                  >
+                    Sign out
+                  </button>
+                </span>
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                <p className="font-medium text-indigo-700">
+                  🔒 Sign in to use your shared brain (rules, learning, history)
+                </p>
+                <div className="flex gap-1.5">
+                  <input
+                    type="password"
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                    placeholder="Password"
+                    className="min-w-0 flex-1 rounded border border-indigo-200 px-2 py-1"
+                  />
+                  <button
+                    disabled={loggingIn}
+                    onClick={handleLogin}
+                    className="shrink-0 rounded bg-indigo-600 px-3 py-1 font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {loggingIn ? "…" : "Sign in"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Reference Notings */}
         <div className="mb-2">
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
@@ -1656,6 +1915,74 @@ export default function App() {
           </button>
           <p className="mt-1 text-[10px] text-gray-400">
             Select one or more — Word, PDF, Excel, or scanned images.
+          </p>
+        </div>
+
+        <hr className="my-3 border-gray-200" />
+
+        {/* Rule Library (GFR / CCS / ... — server-side, cited in every note) */}
+        <div className="mb-2">
+          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
+            📖 Rule Library
+          </h3>
+          {!cloudOn ? (
+            <p className="mb-2 rounded bg-white p-2 text-xs text-gray-400">
+              Set a backend URL in settings (⚙) to store rulebooks.
+            </p>
+          ) : !loggedIn ? (
+            <p className="mb-2 rounded bg-white p-2 text-xs text-gray-400">
+              Sign in above to upload GFR, CCS, FR-SR and other rules.
+            </p>
+          ) : rules.length === 0 ? (
+            <p className="mb-2 rounded bg-white p-2 text-xs text-gray-400">
+              No rules yet. Upload GFR / CCS / FR-SR etc. — notes will cite them.
+            </p>
+          ) : (
+            <ul className="mb-2 space-y-1">
+              {rules.map((r) => (
+                <li
+                  key={r.id}
+                  className="flex items-start justify-between gap-2 rounded bg-white p-2 shadow-sm hover:shadow"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate font-medium text-gray-700">{r.name}</p>
+                    <p className="text-[10px] text-gray-400">
+                      {(r.sectionCount || 0) + " sections · "}
+                      {Math.round((r.chars || 0) / 1000) + "k chars"}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => handleDeleteRule(r.id)}
+                    className="shrink-0 rounded px-1 text-gray-400 hover:bg-red-50 hover:text-red-500"
+                    title="Remove rule"
+                  >
+                    ×
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <input
+            ref={ruleFileInput}
+            type="file"
+            accept={UPLOAD_ACCEPT}
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files && e.target.files[0];
+              if (f) handleRuleUpload(f);
+              e.target.value = "";
+            }}
+          />
+          <button
+            disabled={ruleLoading || !cloudOn || !loggedIn}
+            onClick={() => ruleFileInput.current && ruleFileInput.current.click()}
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-emerald-600 bg-white py-1.5 text-xs font-medium text-emerald-700 transition-all duration-200 hover:bg-emerald-50 disabled:opacity-40"
+          >
+            {ruleLoading ? <Spinner /> : null}
+            {ruleLoading ? "Indexing…" : "+ Add Rulebook (GFR / CCS / …)"}
+          </button>
+          <p className="mt-1 text-[10px] text-gray-400">
+            Stored permanently on your server and cited automatically.
           </p>
         </div>
 
@@ -2077,6 +2404,32 @@ export default function App() {
             </button>
           )}
         </div>
+
+        {/* rules referenced in the latest generation (grounded citations) */}
+        {versions.length > 0 && ruleHits.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1 border-b border-emerald-100 bg-emerald-50 px-3 py-1.5">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-emerald-700">
+              Rules referenced:
+            </span>
+            {Array.from(
+              new Set(
+                ruleHits.map((r) =>
+                  (r.ruleName || "Rule") + (r.label ? " · " + r.label : "")
+                )
+              )
+            )
+              .slice(0, 6)
+              .map((label, i) => (
+                <span
+                  key={i}
+                  className="rounded bg-white px-1.5 py-0.5 text-[10px] text-emerald-700 ring-1 ring-emerald-200"
+                  title="Pulled from your Rule Library and given to the AI as authoritative"
+                >
+                  {label}
+                </span>
+              ))}
+          </div>
+        )}
 
         {/* version tabs */}
         {versions.length > 0 && (
