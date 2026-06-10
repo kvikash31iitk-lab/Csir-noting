@@ -783,11 +783,65 @@ export default function App() {
         const obj = await storageGet(k, true);
         if (obj) items.push(obj);
       }
+      // Merge server-side style examples so reference notings follow the user
+      // across devices (deduped by filename).
+      if (apiBase() && apiToken()) {
+        try {
+          const brain = await api.getBrain();
+          const have = new Set(items.map((x) => (x.filename || "").toLowerCase()));
+          for (const ref of brain.references || []) {
+            if (have.has((ref.name || "").toLowerCase())) continue;
+            const a = ref.analysis || {};
+            items.push({
+              id: ref.id,
+              cloud: true,
+              filename: ref.name,
+              uploadedAt: ref.addedAt,
+              language: a.language || "Mixed",
+              styleRules: a.styleRules || {},
+              tags: a.tags || [],
+            });
+            if (ref.analysis) await mergeAnalysisIntoPatterns(ref.analysis);
+          }
+        } catch (e) {
+          /* offline / not authed: local only */
+        }
+      }
       items.sort((a, b) => (b.uploadedAt || 0) - (a.uploadedAt || 0));
       setRefNotings(items);
     } catch (e) {
       showToast("Storage error — changes may not persist", "error");
     }
+  }
+
+  /* Merge a reference-noting style analysis into the cumulative style patterns
+   * (lib:patterns) that get injected into every generation. */
+  async function mergeAnalysisIntoPatterns(analysis) {
+    if (!analysis) return;
+    const existing =
+      (await storageGet("lib:patterns", true)) || {
+        toneRules: [],
+        structureRules: [],
+        subjectPatterns: [],
+        phrasebook: [],
+      };
+    const dedupe = (arr) => Array.from(new Set(arr.filter(Boolean)));
+    const sr = analysis.styleRules || {};
+    if (sr.tone) existing.toneRules = dedupe([...(existing.toneRules || []), sr.tone]);
+    if (analysis.subjectLinePattern)
+      existing.subjectPatterns = dedupe([
+        ...(existing.subjectPatterns || []),
+        analysis.subjectLinePattern,
+      ]);
+    if (Array.isArray(analysis.keyPhrases))
+      existing.phrasebook = dedupe([...(existing.phrasebook || []), ...analysis.keyPhrases]);
+    if (sr.openingPhrase || sr.closingPhrase)
+      existing.structureRules = dedupe([
+        ...(existing.structureRules || []),
+        sr.openingPhrase ? "Opens with: " + sr.openingPhrase : null,
+        sr.closingPhrase ? "Closes with: " + sr.closingPhrase : null,
+      ]);
+    await storageSet("lib:patterns", existing, true);
   }
 
   /* ============================================================== *
@@ -1191,10 +1245,25 @@ export default function App() {
     }
 
     try {
-      // Step C — store ref noting
+      // Step C — store ref noting (and mirror to the server-side brain so the
+      // style example is available on every device).
       const uuid = Date.now();
+      let cloudId = null;
+      if (apiBase() && apiToken()) {
+        try {
+          const saved = await api.addReference({
+            name: file.name,
+            analysis,
+            summary: (analysis.styleRules && analysis.styleRules.tone) || "",
+          });
+          cloudId = saved && saved.id;
+        } catch (e) {
+          /* keep local-only if the server rejects it */
+        }
+      }
       const record = {
         id: uuid,
+        cloudId,
         filename: file.name,
         uploadedAt: Date.now(),
         styleRules: analysis.styleRules || {},
@@ -1205,35 +1274,8 @@ export default function App() {
       };
       await storageSet("lib:ref:" + uuid, record, true);
 
-      // Step D — merge into lib:patterns
-      const existing =
-        (await storageGet("lib:patterns", true)) || {
-          toneRules: [],
-          structureRules: [],
-          subjectPatterns: [],
-          phrasebook: [],
-        };
-      const dedupe = (arr) => Array.from(new Set(arr.filter(Boolean)));
-      const sr = analysis.styleRules || {};
-      if (sr.tone)
-        existing.toneRules = dedupe([...(existing.toneRules || []), sr.tone]);
-      if (analysis.subjectLinePattern)
-        existing.subjectPatterns = dedupe([
-          ...(existing.subjectPatterns || []),
-          analysis.subjectLinePattern,
-        ]);
-      if (Array.isArray(analysis.keyPhrases))
-        existing.phrasebook = dedupe([
-          ...(existing.phrasebook || []),
-          ...analysis.keyPhrases,
-        ]);
-      if (sr.openingPhrase || sr.closingPhrase)
-        existing.structureRules = dedupe([
-          ...(existing.structureRules || []),
-          sr.openingPhrase ? "Opens with: " + sr.openingPhrase : null,
-          sr.closingPhrase ? "Closes with: " + sr.closingPhrase : null,
-        ]);
-      await storageSet("lib:patterns", existing, true);
+      // Step D — merge into lib:patterns (the style knowledge used at generation)
+      await mergeAnalysisIntoPatterns(analysis);
 
       // Step E — merge signature chain
       if (
@@ -1291,7 +1333,12 @@ export default function App() {
 
   async function deleteRef(id) {
     try {
+      const item = refNotings.find((r) => r.id === id);
       await storageDelete("lib:ref:" + id, true);
+      const cloudId = item && (item.cloudId || (item.cloud ? item.id : null));
+      if (apiBase() && apiToken() && cloudId) {
+        try { await api.delReference(cloudId); } catch (e) {}
+      }
       await refreshLibrary();
       showToast("Reference noting removed", "info");
     } catch (e) {
