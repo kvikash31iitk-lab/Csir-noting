@@ -210,6 +210,100 @@ async function callClaude(systemPrompt, userMessage) {
   return block && block.text ? block.text : "";
 }
 
+/* ------------------------------------------------------------------ *
+ *  Brain API client — server-side memory, rule library, Claude OCR.
+ *  The base URL is derived from the configured backend (…/generate ->
+ *  its root); the login token is kept in localStorage.
+ * ------------------------------------------------------------------ */
+function apiBase() {
+  try {
+    const url = (localStorage.getItem("cfg::backendUrl") || "").trim();
+    if (!url) return "";
+    return url.replace(/\/generate\/?$/, "").replace(/\/$/, "");
+  } catch (_) {
+    return "";
+  }
+}
+function apiToken() {
+  try {
+    return localStorage.getItem("cfg::noteToken") || "";
+  } catch (_) {
+    return "";
+  }
+}
+function setApiToken(t) {
+  try {
+    if (t) localStorage.setItem("cfg::noteToken", t);
+    else localStorage.removeItem("cfg::noteToken");
+  } catch (_) {}
+}
+async function apiFetch(pathname, opts) {
+  opts = opts || {};
+  const base = apiBase();
+  if (!base) throw new Error("no backend configured");
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  const tok = apiToken();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  const res = await fetch(base + pathname, Object.assign({}, opts, { headers }));
+  if (res.status === 401) {
+    setApiToken("");
+    const e = new Error("unauthorized");
+    e.code = "UNAUTHORIZED";
+    throw e;
+  }
+  if (!res.ok) {
+    let msg = "HTTP " + res.status;
+    try {
+      const j = await res.json();
+      if (j && j.error) msg = j.error;
+    } catch (_) {}
+    throw new Error(msg);
+  }
+  if (res.status === 204) return null;
+  return await res.json();
+}
+const api = {
+  login: (password) =>
+    apiFetch("/login", { method: "POST", body: JSON.stringify({ password }) }),
+  getBrain: () => apiFetch("/brain"),
+  addLearning: (text) =>
+    apiFetch("/brain/learning", { method: "POST", body: JSON.stringify({ text }) }),
+  delLearning: (id) => apiFetch("/brain/learning/" + id, { method: "DELETE" }),
+  addReference: (r) =>
+    apiFetch("/brain/reference", { method: "POST", body: JSON.stringify(r) }),
+  delReference: (id) => apiFetch("/brain/reference/" + id, { method: "DELETE" }),
+  addRule: (name, text) =>
+    apiFetch("/brain/rule", { method: "POST", body: JSON.stringify({ name, text }) }),
+  delRule: (id) => apiFetch("/brain/rule/" + id, { method: "DELETE" }),
+  searchRules: (q, k) =>
+    apiFetch("/brain/rules/search?q=" + encodeURIComponent(q) + "&k=" + (k || 6)),
+  addNote: (n) => apiFetch("/brain/note", { method: "POST", body: JSON.stringify(n) }),
+  extract: (payload) =>
+    apiFetch("/extract", { method: "POST", body: JSON.stringify(payload) }),
+};
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ""));
+    r.onerror = () => reject(new Error("read fail"));
+    r.readAsDataURL(file);
+  });
+}
+/* Claude-vision OCR via the backend (primary engine). Returns "" if no backend
+ * is configured or the call is rejected, so the caller can fall back locally. */
+async function ocrViaBackend(file, onStatus) {
+  if (!apiBase()) return "";
+  if (typeof onStatus === "function") onStatus("Reading with Claude vision…");
+  const dataUrl = await fileToDataUrl(file);
+  const out = await api.extract({
+    dataUrl,
+    filename: file.name,
+    mimeType: file.type || "",
+  });
+  return (out && out.text) || "";
+}
+
 /* ---- CDN script loading ---- */
 const scriptCache = {};
 function loadScript(src) {
@@ -335,9 +429,14 @@ async function ocrWithTesseract(file, onStatus) {
 }
 
 /* OCR dispatcher. Claude vision (the better engine for Hindi / messy govt
- * scans) is the primary path; tesseract.js is the local fallback. The Claude
- * path is wired in a later step, so for now this resolves to Tesseract. */
+ * scans) is the primary path; tesseract.js is the local fallback. */
 async function ocrFile(file, onStatus) {
+  try {
+    const viaClaude = await ocrViaBackend(file, onStatus);
+    if (viaClaude && viaClaude.replace(/\s/g, "").length >= 5) return viaClaude;
+  } catch (_) {
+    /* fall back to local OCR */
+  }
   return await ocrWithTesseract(file, onStatus);
 }
 

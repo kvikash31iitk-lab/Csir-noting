@@ -1,26 +1,38 @@
 /*
- * CSIR Note Sheet — backend bridge to Claude Code
- * ------------------------------------------------
- * One endpoint, POST /generate, that takes { system, user } and runs the
- * `claude` CLI in headless print mode to produce the text. Because `claude`
- * is logged in with a Claude Max subscription on this server, generation uses
- * the subscription — NO ANTHROPIC_API_KEY required.
+ * CSIR Note Sheet — backend "brain" for the note-sheet app
+ * --------------------------------------------------------
+ * Runs the `claude` CLI (logged in with a Claude Max subscription, so NO
+ * ANTHROPIC_API_KEY is needed) and keeps a small, file-based memory so the app
+ * becomes a growing institutional assistant.
  *
- * The response is shaped like the Anthropic Messages API
- * ({ content: [{ type:"text", text }] }) so the web app's existing code works
- * unchanged.
+ * Endpoints
+ *   GET  /health                      liveness
+ *   POST /generate {system,user}      stateless text/JSON generation (unchanged)
+ *   POST /extract  {dataUrl|base64}   OCR a scan/image/PDF via Claude vision
+ *   POST /login    {password}         -> { token }  (Bearer for the routes below)
+ *   GET  /brain                       full memory (learning, references, rules, notes)
+ *   POST /brain/learning {text}       add a standing instruction
+ *   DELETE /brain/learning/:id
+ *   POST /brain/reference {name,...}  remember a reference-noting style analysis
+ *   DELETE /brain/reference/:id
+ *   POST /brain/rule {name,text}      add a rulebook (GFR/CCS/...) -> chunked + indexed
+ *   DELETE /brain/rule/:id
+ *   GET  /brain/rules/search?q=&k=    keyword retrieval over rule sections (RAG)
+ *   POST /brain/note {title,...}      save a generated/edited note to history
+ *   GET  /backup                      download the whole brain as JSON
  *
- * Config via environment variables (see .env.example):
- *   PORT                Port to listen on (default 8787)
- *   ALLOWED_ORIGIN      CORS origin allowed to call this (e.g. https://notesheet.cheetsheet.tech)
- *   CLAUDE_BIN          Path to the claude binary (default "claude")
- *   CLAUDE_MODEL        Optional model (e.g. "sonnet", "opus")
- *   SYSTEM_PROMPT_FLAG  "--append-system-prompt" (default) or "--system-prompt"
- *   CLAUDE_EXTRA_ARGS   Optional extra CLI args, space-separated
- *   TIMEOUT_MS          Per-request timeout (default 120000)
+ * Config (environment variables):
+ *   PORT, ALLOWED_ORIGIN, CLAUDE_BIN, CLAUDE_MODEL, SYSTEM_PROMPT_FLAG,
+ *   CLAUDE_MAX_TURNS, CLAUDE_DISABLE_TOOLS, CLAUDE_EXTRA_ARGS, TIMEOUT_MS,
+ *   APP_PASSWORD   password gating the /brain + /extract routes (unset = open)
+ *   APP_SECRET     HMAC secret for tokens (defaults derived from APP_PASSWORD)
+ *   DATA_DIR       where brain.json lives (default ./data)
+ *   OCR_TOOLS      tools the OCR call may use (default "Read")
+ *   OCR_MAX_TURNS  (default 6)   OCR_TIMEOUT_MS (default 180000)
  */
 const express = require("express");
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
@@ -29,109 +41,325 @@ const PORT = parseInt(process.env.PORT || "8787", 10);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "";
-// Replace Claude Code's default coding-agent system prompt with the app's own
-// (use --append-system-prompt only if you explicitly want to keep the default).
 const SYSTEM_PROMPT_FLAG = process.env.SYSTEM_PROMPT_FLAG || "--system-prompt";
 const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || "1";
-// Pass --tools "" to disable all tools (pure text completion). Set
-// CLAUDE_DISABLE_TOOLS=0 to skip this if a CLI version doesn't accept it.
 const DISABLE_TOOLS = process.env.CLAUDE_DISABLE_TOOLS !== "0";
 const EXTRA_ARGS = (process.env.CLAUDE_EXTRA_ARGS || "").split(" ").filter(Boolean);
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "120000", 10);
 
-// Run claude in a neutral, empty directory so it has no project/code context
-// (no CLAUDE.md, no source files) to "look at" — it must answer from the prompt.
+const APP_PASSWORD = process.env.APP_PASSWORD || "";
+const APP_SECRET =
+  process.env.APP_SECRET ||
+  crypto.createHash("sha256").update("csir-note::" + (APP_PASSWORD || "open")).digest("hex");
+
+// Neutral, empty working dir so /generate has no project/code to "look at".
 const NEUTRAL_CWD =
   process.env.CLAUDE_CWD || path.join(os.tmpdir(), "csir-note-api-cwd");
-try {
-  fs.mkdirSync(NEUTRAL_CWD, { recursive: true });
-} catch (_) {}
+try { fs.mkdirSync(NEUTRAL_CWD, { recursive: true }); } catch (_) {}
 
+/* ------------------------------------------------------------------ *
+ *  File-based memory ("the brain")
+ * ------------------------------------------------------------------ */
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+const BRAIN_FILE = path.join(DATA_DIR, "brain.json");
+
+const EMPTY_BRAIN = { learning: [], references: [], rules: [], notes: [] };
+function loadBrain() {
+  try {
+    const b = JSON.parse(fs.readFileSync(BRAIN_FILE, "utf8"));
+    return Object.assign({}, EMPTY_BRAIN, b);
+  } catch (_) { return JSON.parse(JSON.stringify(EMPTY_BRAIN)); }
+}
+let brain = loadBrain();
+function saveBrain() {
+  const tmp = BRAIN_FILE + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(brain, null, 2));
+  fs.renameSync(tmp, BRAIN_FILE);
+}
+const newId = () => crypto.randomBytes(8).toString("hex");
+
+/* Split a rulebook into searchable sections. Detects "Rule/Section/Para N"
+ * headings where possible and otherwise packs ~1200-char windows. */
+function chunkRuleText(text) {
+  const clean = String(text).replace(/\r/g, "");
+  const paras = clean.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
+  const headRe =
+    /\b(Rule|Section|Para(?:graph)?|Article|Clause|Regulation|GFR|FR|SR)\s+([0-9]+[A-Za-z()\-.]*)/i;
+  const chunks = [];
+  let buf = "", label = "";
+  const flush = () => { if (buf.trim()) { chunks.push({ label, text: buf.trim() }); buf = ""; } };
+  for (const p of paras) {
+    const m = p.match(headRe);
+    if (m && buf.length > 400) flush();
+    if (m) label = (m[1] + " " + m[2]).replace(/\s+/g, " ").trim();
+    buf += (buf ? "\n\n" : "") + p;
+    if (buf.length >= 1200) flush();
+  }
+  flush();
+  return chunks.map((c, i) => ({ idx: i, label: c.label || "", text: c.text }));
+}
+
+/* Keyword retrieval over all rule sections (the "R" in RAG, phase-1 simple). */
+function searchRules(q, limit) {
+  const terms = (String(q || "").toLowerCase().match(/[a-z0-9]{3,}/g) || []).slice(0, 30);
+  if (!terms.length) return [];
+  const out = [];
+  for (const rule of brain.rules) {
+    for (const ch of rule.sections || []) {
+      const hay = ((ch.label || "") + " " + ch.text).toLowerCase();
+      let score = 0;
+      for (const t of terms) {
+        let idx = 0, c = 0;
+        while ((idx = hay.indexOf(t, idx)) !== -1) { c++; idx += t.length; }
+        if (c) score += c;
+        if ((ch.label || "").toLowerCase().indexOf(t) !== -1) score += 3;
+      }
+      if (score > 0)
+        out.push({ score, ruleId: rule.id, ruleName: rule.name, label: ch.label, text: ch.text });
+    }
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out.slice(0, limit || 6);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Auth (single-user password -> stateless HMAC token)
+ * ------------------------------------------------------------------ */
+function signToken() {
+  const payload = "v1." + Date.now();
+  const sig = crypto.createHmac("sha256", APP_SECRET).update(payload).digest("hex");
+  return payload + "." + sig;
+}
+function verifyToken(tok) {
+  const parts = String(tok || "").split(".");
+  if (parts.length !== 3) return false;
+  const payload = parts[0] + "." + parts[1];
+  const expect = crypto.createHmac("sha256", APP_SECRET).update(payload).digest("hex");
+  const a = Buffer.from(parts[2]); const b = Buffer.from(expect);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function requireAuth(req, res, next) {
+  if (!APP_PASSWORD) return next(); // not configured -> open (set APP_PASSWORD to lock)
+  const h = req.headers.authorization || "";
+  const tok = h.indexOf("Bearer ") === 0 ? h.slice(7) : "";
+  if (verifyToken(tok)) return next();
+  return res.status(401).json({ error: "unauthorized" });
+}
+
+/* ------------------------------------------------------------------ *
+ *  Claude CLI runner (used by /generate and /extract)
+ * ------------------------------------------------------------------ */
+function runClaude({ args, stdin, cwd, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    const fullArgs = args.slice();
+    if (CLAUDE_MODEL && fullArgs.indexOf("--model") === -1) fullArgs.push("--model", CLAUDE_MODEL);
+    fullArgs.push(...EXTRA_ARGS);
+    const env = Object.assign({}, process.env);
+    delete env.ANTHROPIC_API_KEY; // force subscription auth
+
+    let child;
+    try { child = spawn(CLAUDE_BIN, fullArgs, { env, cwd: cwd || NEUTRAL_CWD }); }
+    catch (e) { return reject(new Error("could not start claude: " + e.message)); }
+
+    let out = "", err = "", finished = false;
+    const fin = (fn) => { if (!finished) { finished = true; fn(); } };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch (_) {}
+      fin(() => reject(new Error("claude timed out")));
+    }, timeoutMs || TIMEOUT_MS);
+
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("error", (e) => { clearTimeout(timer); fin(() => reject(new Error("claude spawn error: " + e.message))); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0 && !out)
+        return fin(() => reject(new Error("claude exited " + code + ": " + err.slice(0, 400))));
+      let text = out;
+      try {
+        const j = JSON.parse(out);
+        text = j.result || j.text || (j.content && j.content[0] && j.content[0].text) || out;
+      } catch (_) {}
+      fin(() => resolve(text));
+    });
+
+    try { if (stdin != null) child.stdin.write(stdin); child.stdin.end(); }
+    catch (e) { clearTimeout(timer); fin(() => reject(new Error("failed writing prompt: " + e.message))); }
+  });
+}
+
+/* ------------------------------------------------------------------ *
+ *  HTTP app
+ * ------------------------------------------------------------------ */
 const app = express();
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "30mb" })); // large enough for base64 scans
 
-// --- CORS ---
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => res.json({ ok: true, hasPassword: !!APP_PASSWORD }));
 
-app.post("/generate", (req, res) => {
+// --- generation (unchanged behaviour) ---
+app.post("/generate", async (req, res) => {
   const body = req.body || {};
   const system = typeof body.system === "string" ? body.system : "";
   const user = typeof body.user === "string" ? body.user : "";
   if (!user) return res.status(400).json({ error: "missing 'user' prompt" });
 
-  // Build the claude command. User prompt goes via stdin (handles large
-  // documents safely); system prompt via flag. We run it as a single-turn,
-  // tool-less text completion so it returns the requested text/JSON rather than
-  // behaving as an interactive coding agent.
   const args = ["-p", "--output-format", "json"];
   if (system) args.push(SYSTEM_PROMPT_FLAG, system);
   args.push("--max-turns", String(MAX_TURNS));
   if (DISABLE_TOOLS) args.push("--tools", "");
-  if (CLAUDE_MODEL) args.push("--model", CLAUDE_MODEL);
-  args.push(...EXTRA_ARGS);
 
-  // Ensure subscription auth is used, never an accidental API key.
-  const env = { ...process.env };
-  delete env.ANTHROPIC_API_KEY;
-
-  let child;
   try {
-    child = spawn(CLAUDE_BIN, args, { env, cwd: NEUTRAL_CWD });
+    const text = await runClaude({ args, stdin: user, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS });
+    res.json({ content: [{ type: "text", text }] });
   } catch (e) {
-    return res.status(500).json({ error: "could not start claude: " + e.message });
-  }
-
-  let out = "", err = "", finished = false;
-  const done = (fn) => { if (!finished) { finished = true; fn(); } };
-
-  const timer = setTimeout(() => {
-    try { child.kill("SIGKILL"); } catch (_) {}
-    done(() => res.status(504).json({ error: "claude timed out" }));
-  }, TIMEOUT_MS);
-
-  child.stdout.on("data", (d) => { out += d; });
-  child.stderr.on("data", (d) => { err += d; });
-  child.on("error", (e) => {
-    clearTimeout(timer);
-    done(() => res.status(500).json({ error: "claude spawn error: " + e.message }));
-  });
-  child.on("close", (code) => {
-    clearTimeout(timer);
-    if (code !== 0 && !out) {
-      return done(() => res.status(500).json({
-        error: "claude exited with code " + code,
-        stderr: err.slice(0, 800),
-      }));
-    }
-    // The --output-format json envelope has the assistant text in .result.
-    let text = out;
-    try {
-      const j = JSON.parse(out);
-      text = j.result || j.text ||
-        (j.content && j.content[0] && j.content[0].text) || out;
-    } catch (_) { /* fall back to raw stdout */ }
-    done(() => res.json({ content: [{ type: "text", text }] }));
-  });
-
-  // Send the user prompt on stdin, then close it.
-  try {
-    child.stdin.write(user);
-    child.stdin.end();
-  } catch (e) {
-    clearTimeout(timer);
-    done(() => res.status(500).json({ error: "failed writing prompt: " + e.message }));
+    res.status(500).json({ error: String((e && e.message) || e) });
   }
 });
 
+// --- OCR via Claude vision (Read tool on a temp file) ---
+app.post("/extract", requireAuth, async (req, res) => {
+  const b = req.body || {};
+  let raw = b.dataUrl || b.imageBase64 || b.base64 || "";
+  let mime = b.mimeType || "";
+  const m = /^data:([^;]+);base64,(.*)$/s.exec(raw);
+  if (m) { mime = mime || m[1]; raw = m[2]; }
+  if (!raw) return res.status(400).json({ error: "missing image/file data" });
+
+  // Prefer the real file extension (handles PDFs); fall back to the mime type.
+  let ext = "";
+  const fe = String(b.filename || "").toLowerCase().match(/\.([a-z0-9]+)$/);
+  if (fe) ext = fe[1];
+  if (!ext) ext = (b.ext || mime.split("/")[1] || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (ext === "jpeg") ext = "jpg";
+  if (!ext) ext = "png";
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ocr-"));
+  const fname = "page." + ext;
+  const fpath = path.join(dir, fname);
+  try {
+    fs.writeFileSync(fpath, Buffer.from(raw, "base64"));
+    const prompt =
+      "Read the file ./" + fname + " in the current directory and transcribe ALL of " +
+      "its text verbatim, preserving line breaks and layout where reasonable. It may " +
+      "contain a mix of English and Hindi (Devanagari) — transcribe both faithfully. " +
+      "Do not summarise, translate, or add commentary. Output ONLY the transcribed text.";
+    const text = await runClaude({
+      args: [
+        "-p", "--output-format", "json",
+        "--max-turns", process.env.OCR_MAX_TURNS || "6",
+        "--tools", process.env.OCR_TOOLS || "Read",
+      ],
+      stdin: prompt,
+      cwd: dir,
+      timeoutMs: parseInt(process.env.OCR_TIMEOUT_MS || "180000", 10),
+    });
+    res.json({ text: String(text || "").trim() });
+  } catch (e) {
+    res.status(500).json({ error: "ocr failed: " + String((e && e.message) || e) });
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+  }
+});
+
+// --- auth ---
+app.post("/login", (req, res) => {
+  const pw = (req.body && req.body.password) || "";
+  if (APP_PASSWORD && pw !== APP_PASSWORD) return res.status(401).json({ error: "wrong password" });
+  res.json({ token: signToken() });
+});
+
+// --- brain: read everything (rule full text trimmed out of the list) ---
+app.get("/brain", requireAuth, (_req, res) => {
+  res.json({
+    learning: brain.learning,
+    references: brain.references,
+    rules: brain.rules.map((r) => ({
+      id: r.id, name: r.name, addedAt: r.addedAt,
+      sectionCount: (r.sections || []).length, chars: r.chars || 0,
+    })),
+    notes: brain.notes.slice(-50),
+  });
+});
+
+// standing instructions (permanent learning)
+app.post("/brain/learning", requireAuth, (req, res) => {
+  const text = ((req.body && req.body.text) || "").trim();
+  if (!text) return res.status(400).json({ error: "empty" });
+  const item = { id: newId(), text, addedAt: Date.now() };
+  brain.learning.push(item); saveBrain(); res.json(item);
+});
+app.delete("/brain/learning/:id", requireAuth, (req, res) => {
+  brain.learning = brain.learning.filter((x) => x.id !== req.params.id);
+  saveBrain(); res.json({ ok: true });
+});
+
+// reference-noting style memory
+app.post("/brain/reference", requireAuth, (req, res) => {
+  const b = req.body || {};
+  const item = {
+    id: newId(), name: b.name || "reference",
+    analysis: b.analysis || null, summary: b.summary || "", addedAt: Date.now(),
+  };
+  brain.references.push(item); saveBrain(); res.json(item);
+});
+app.delete("/brain/reference/:id", requireAuth, (req, res) => {
+  brain.references = brain.references.filter((x) => x.id !== req.params.id);
+  saveBrain(); res.json({ ok: true });
+});
+
+// rule library
+app.post("/brain/rule", requireAuth, (req, res) => {
+  const b = req.body || {};
+  const text = (b.text || "").trim();
+  if (!text) return res.status(400).json({ error: "empty rule text" });
+  const sections = chunkRuleText(text);
+  const item = {
+    id: newId(), name: b.name || "Rule document", addedAt: Date.now(),
+    chars: text.length, sections,
+  };
+  brain.rules.push(item); saveBrain();
+  res.json({ id: item.id, name: item.name, addedAt: item.addedAt, sectionCount: sections.length, chars: item.chars });
+});
+app.delete("/brain/rule/:id", requireAuth, (req, res) => {
+  brain.rules = brain.rules.filter((x) => x.id !== req.params.id);
+  saveBrain(); res.json({ ok: true });
+});
+app.get("/brain/rules/search", requireAuth, (req, res) => {
+  res.json({ results: searchRules(req.query.q || "", parseInt(req.query.k || "6", 10)) });
+});
+
+// note history
+app.post("/brain/note", requireAuth, (req, res) => {
+  const b = req.body || {};
+  const item = {
+    id: newId(), title: b.title || "", instructions: b.instructions || "",
+    draft: b.draft || "", final: b.final || "", addedAt: Date.now(),
+  };
+  brain.notes.push(item);
+  if (brain.notes.length > 500) brain.notes = brain.notes.slice(-500);
+  saveBrain(); res.json(item);
+});
+
+// full backup
+app.get("/backup", requireAuth, (_req, res) => {
+  res.setHeader("Content-Disposition", 'attachment; filename="note-brain-backup.json"');
+  res.json(brain);
+});
+
 app.listen(PORT, () => {
-  console.log(`csir-note-api listening on :${PORT} (origin: ${ALLOWED_ORIGIN})`);
+  console.log(
+    "csir-note-api listening on :" + PORT +
+    " (origin: " + ALLOWED_ORIGIN + ", auth: " + (APP_PASSWORD ? "on" : "OPEN") +
+    ", data: " + DATA_DIR + ")"
+  );
 });
