@@ -1,0 +1,13 @@
+{
+  "name": "csir-note-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tiny backend that generates note sheets via the Claude Code CLI (uses a Claude Max subscription, no API key).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

@@ -39,7 +39,7 @@
     },
   };
 
-  /* ---------------- API key helpers ---------------- */
+  /* ---------------- API key + backend helpers ---------------- */
   function getKey() {
     try {
       return localStorage.getItem("cfg::anthropicKey") || "";
@@ -51,6 +51,19 @@
     try {
       if (k) localStorage.setItem("cfg::anthropicKey", k);
       else localStorage.removeItem("cfg::anthropicKey");
+    } catch (e) {}
+  }
+  function getBackend() {
+    try {
+      return (localStorage.getItem("cfg::backendUrl") || "").trim();
+    } catch (e) {
+      return "";
+    }
+  }
+  function setBackend(u) {
+    try {
+      if (u) localStorage.setItem("cfg::backendUrl", u);
+      else localStorage.removeItem("cfg::backendUrl");
     } catch (e) {}
   }
 
@@ -163,31 +176,40 @@
     opts = opts || {};
     var u = typeof url === "string" ? url : (url && url.url) || "";
     if (u.indexOf("api.anthropic.com") !== -1) {
+      var backend = getBackend();
       var key = getKey();
       var body = {};
       try {
         body = JSON.parse(opts.body);
       } catch (e) {}
-      if (!key) {
-        // DEMO mode
-        return delay(800).then(function () {
-          return jsonResp(
-            demoFor(
-              body.system || "",
-              (body.messages && body.messages[0] && body.messages[0].content) ||
-                ""
-            )
-          );
+      var sysP = body.system || "";
+      var userP =
+        (body.messages && body.messages[0] && body.messages[0].content) || "";
+
+      // 1) BACKEND mode — uses your Claude subscription via your server.
+      if (backend) {
+        return realFetch(backend, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ system: sysP, user: userP }),
         });
       }
-      // REAL call with the user's key
-      var headers = Object.assign({}, opts.headers || {}, {
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-        "content-type": "application/json",
+
+      // 2) API-KEY mode — direct call with the user's key.
+      if (key) {
+        var headers = Object.assign({}, opts.headers || {}, {
+          "x-api-key": key,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+          "content-type": "application/json",
+        });
+        return realFetch(url, Object.assign({}, opts, { headers: headers }));
+      }
+
+      // 3) DEMO mode — built-in sample responses, fully offline.
+      return delay(800).then(function () {
+        return jsonResp(demoFor(sysP, userP));
       });
-      return realFetch(url, Object.assign({}, opts, { headers: headers }));
     }
     return realFetch(url, opts);
   };
@@ -214,20 +236,30 @@
       card.style.cssText =
         "background:#fff;border-radius:12px;max-width:420px;width:100%;padding:18px;font-family:sans-serif;color:#111;";
       var key = getKey();
+      var backend = getBackend();
+      var mode = backend
+        ? "✓ Using your Claude subscription (backend)."
+        : key
+        ? "✓ Using your Anthropic API key."
+        : "Currently running in demo mode.";
       card.innerHTML =
         '<h3 style="margin:0 0 8px;font-size:16px;font-weight:700;">AI Settings</h3>' +
-        '<p style="margin:0 0 10px;font-size:12px;color:#555;line-height:1.4;">' +
-        "Paste your <b>Anthropic API key</b> (from console.anthropic.com) to enable real AI note-writing. " +
-        "Leave it blank to keep using the built-in <b>demo mode</b>. The key is stored only on this phone." +
+        '<p style="margin:0 0 6px;font-size:12px;color:#555;line-height:1.4;">' +
+        "Choose how the app writes notes. Both fields are stored only on this device." +
         "</p>" +
+        '<label style="font-size:11px;font-weight:600;color:#374151;">Backend URL — uses your Claude subscription (recommended)</label>' +
+        '<input id="ck_backend" type="text" placeholder="https://noteapi.cheetsheet.tech/generate" value="' +
+        (backend ? backend.replace(/"/g, "&quot;") : "") +
+        '" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:8px;font-size:13px;margin:4px 0 10px;"/>' +
+        '<label style="font-size:11px;font-weight:600;color:#374151;">…or Anthropic API key (pay-as-you-go)</label>' +
         '<input id="ck_key" type="password" placeholder="sk-ant-..." value="' +
         (key ? key.replace(/"/g, "&quot;") : "") +
-        '" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:8px;font-size:13px;margin-bottom:6px;"/>' +
+        '" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:8px;font-size:13px;margin:4px 0 6px;"/>' +
         '<p style="margin:0 0 12px;font-size:11px;color:' +
-        (key ? "#16a34a" : "#6b7280") +
+        (backend || key ? "#16a34a" : "#6b7280") +
         ';">' +
-        (key ? "✓ Real AI is enabled." : "Currently running in demo mode.") +
-        "</p>" +
+        mode +
+        " (If Backend URL is set, it takes priority; blank both = demo.)</p>" +
         '<div style="display:flex;gap:8px;">' +
         '<button id="ck_save" style="flex:1;padding:8px;border:none;border-radius:8px;background:#2563eb;color:#fff;font-weight:600;cursor:pointer;">Save</button>' +
         '<button id="ck_clear" style="flex:1;padding:8px;border:none;border-radius:8px;background:#f3f4f6;color:#374151;cursor:pointer;">Use demo</button>' +
@@ -239,10 +271,12 @@
         if (e.target === overlay) document.body.removeChild(overlay);
       });
       card.querySelector("#ck_save").onclick = function () {
+        setBackend(card.querySelector("#ck_backend").value.trim());
         setKey(card.querySelector("#ck_key").value.trim());
         location.reload();
       };
       card.querySelector("#ck_clear").onclick = function () {
+        setBackend("");
         setKey("");
         location.reload();
       };
