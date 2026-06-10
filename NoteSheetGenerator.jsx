@@ -916,7 +916,12 @@ export default function App() {
    *  FEATURE 3: FIRST NOTE GENERATION
    * ============================================================== */
   async function handleGenerate() {
-    if (!facts) return;
+    // A source document is optional — a note can be started from the user's
+    // instruction alone. Only block if there's neither facts nor an instruction.
+    if (!facts && !chatInput.trim()) {
+      showToast("Type what the note should say, then Send", "error");
+      return;
+    }
     setGenerating(true);
     try {
       const sys = await buildSystemPrompt();
@@ -926,16 +931,23 @@ export default function App() {
           : [];
       const instruction =
         chatInput.trim() || "Generate a noting";
-      const userMsg =
-        "Create a formal noting based on these verified facts: " +
-        JSON.stringify(facts) +
-        ". User instruction: " +
-        instruction +
-        ". Language preference: " +
-        language +
-        ". Use signature chain: " +
-        JSON.stringify(chain) +
-        ".";
+      const userMsg = facts
+        ? "Create a formal noting based on these verified facts: " +
+          JSON.stringify(facts) +
+          ". User instruction: " +
+          instruction +
+          ". Language preference: " +
+          language +
+          ". Use signature chain: " +
+          JSON.stringify(chain) +
+          "."
+        : "Create a formal government office noting from scratch based on this instruction: " +
+          instruction +
+          ". There is no source document; infer reasonable, clearly-labelled placeholder details (date, references, amounts) where specifics are not given, so the user can edit them. Language preference: " +
+          language +
+          ". Use signature chain: " +
+          JSON.stringify(chain) +
+          ".";
       const resp = await callClaude(sys, userMsg);
       const note = normalizeNote(parseJSON(resp));
       if (!note) {
@@ -1663,8 +1675,10 @@ export default function App() {
         <div className="flex-1 space-y-3 overflow-y-auto p-4">
           {chatHistory.length === 0 && (!facts || factCardHidden) && (
             <p className="mt-8 text-center text-xs text-gray-400">
-              Upload a source document and generate a note to start the
-              conversation.
+              Type what you need below and press Send to start a note — e.g.
+              “Draft a note seeking approval to purchase 5 laptops under GFR
+              2017.” Or upload a source document on the left to auto-extract
+              facts first.
             </p>
           )}
           {chatHistory.map((m, i) =>
@@ -1709,7 +1723,11 @@ export default function App() {
                 handleSend();
               }
             }}
-            placeholder="Refine the note... e.g. Add GFR rule reference, change the date, add Hindi subject line"
+            placeholder={
+              versions.length === 0
+                ? "Describe the note you need... e.g. Draft a note for purchase of 5 laptops under GFR 2017, then press Send"
+                : "Refine the note... e.g. Add GFR rule reference, change the date, add Hindi subject line"
+            }
             className="max-h-32 w-full resize-none rounded-lg border border-gray-300 px-3 py-2 text-sm transition-all duration-200 focus:border-blue-400 focus:outline-none"
             style={{ minHeight: "3rem" }}
           />
