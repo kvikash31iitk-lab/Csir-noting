@@ -658,6 +658,7 @@ export default function App() {
   const [chatInput, setChatInput] = useState("");
   const [aiTyping, setAiTyping] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
+  const [editing, setEditing] = useState(false);
   const [tabOffset, setTabOffset] = useState(0);
   const [activePanel, setActivePanel] = useState("library"); // mobile: which column is shown
   // On wide screens we show all three columns at once; on phones we show one
@@ -1585,6 +1586,7 @@ export default function App() {
       showToast("Type what the note should say, then Send", "error");
       return;
     }
+    setEditing(false);
     setGenerating(true);
     try {
       const chain =
@@ -1673,6 +1675,7 @@ export default function App() {
       return;
     }
 
+    setEditing(false);
     const userMsgEntry = { role: "user", text: msg };
     const newChatWithUser = [...chatHistory, userMsgEntry];
     setChatHistory(newChatWithUser);
@@ -1948,6 +1951,64 @@ export default function App() {
   const currentNote = versions[activeVersion] || null;
   const prevNote =
     activeVersion > 0 ? versions[activeVersion - 1] || null : null;
+
+  /* ---- inline editing (Phase A): write manual edits back into the active
+   * version so the AI, the DOCX export and the session all stay in sync. ---- */
+  function updateActiveNote(mutator) {
+    const cur = versions[activeVersion];
+    if (!cur) return;
+    const updated = mutator({ ...cur });
+    updated._ts = Date.now();
+    const next = versions.slice();
+    next[activeVersion] = updated;
+    setVersions(next);
+    persistSession({ versions: next, activeVersion });
+  }
+  const edit = {
+    setField: (field, value) =>
+      updateActiveNote((n) => ({ ...n, [field]: value })),
+    setParagraph: (i, value) =>
+      updateActiveNote((n) => {
+        const paragraphs = (n.paragraphs || []).slice();
+        paragraphs[i] = value;
+        return { ...n, paragraphs };
+      }),
+    addParagraph: (i) =>
+      updateActiveNote((n) => {
+        const paragraphs = (n.paragraphs || []).slice();
+        paragraphs.splice(i + 1, 0, "");
+        return { ...n, paragraphs };
+      }),
+    deleteParagraph: (i) =>
+      updateActiveNote((n) => {
+        const paragraphs = (n.paragraphs || []).slice();
+        paragraphs.splice(i, 1);
+        return { ...n, paragraphs };
+      }),
+    setDetail: (i, key, value) =>
+      updateActiveNote((n) => {
+        const detailsBlock = (n.detailsBlock || []).map((d) => ({ ...d }));
+        if (detailsBlock[i]) detailsBlock[i][key] = value;
+        return { ...n, detailsBlock };
+      }),
+    deleteDetail: (i) =>
+      updateActiveNote((n) => {
+        const detailsBlock = (n.detailsBlock || []).slice();
+        detailsBlock.splice(i, 1);
+        return { ...n, detailsBlock };
+      }),
+    addDetail: () =>
+      updateActiveNote((n) => ({
+        ...n,
+        detailsBlock: [...(n.detailsBlock || []), { label: "", value: "" }],
+      })),
+    setSignature: (i, value) =>
+      updateActiveNote((n) => {
+        const signatureChain = (n.signatureChain || []).slice();
+        signatureChain[i] = value;
+        return { ...n, signatureChain };
+      }),
+  };
 
   const visibleTabs = (() => {
     const total = versions.length;
@@ -2590,20 +2651,46 @@ export default function App() {
       >
         <div className="flex items-center justify-between border-b border-gray-200 p-4">
           <h2 className="text-lg font-bold">📄 Note Preview</h2>
-          {versions.length > 1 && (
-            <button
-              onClick={() => setShowDiff((d) => !d)}
-              className={
-                "rounded px-2 py-1 text-xs font-medium transition-colors duration-200 " +
-                (showDiff
-                  ? "bg-blue-600 text-white"
-                  : "bg-gray-100 text-gray-600 hover:bg-gray-200")
-              }
-            >
-              {showDiff ? "Hide changes" : "Show changes"}
-            </button>
-          )}
+          <div className="flex items-center gap-2">
+            {currentNote && (
+              <button
+                onClick={() => {
+                  setEditing((e) => !e);
+                  setShowDiff(false);
+                }}
+                className={
+                  "rounded px-2 py-1 text-xs font-medium transition-colors duration-200 " +
+                  (editing
+                    ? "bg-emerald-600 text-white"
+                    : "bg-gray-100 text-gray-600 hover:bg-gray-200")
+                }
+                title="Edit the note text directly"
+              >
+                {editing ? "✓ Done editing" : "✏️ Edit"}
+              </button>
+            )}
+            {versions.length > 1 && !editing && (
+              <button
+                onClick={() => setShowDiff((d) => !d)}
+                className={
+                  "rounded px-2 py-1 text-xs font-medium transition-colors duration-200 " +
+                  (showDiff
+                    ? "bg-blue-600 text-white"
+                    : "bg-gray-100 text-gray-600 hover:bg-gray-200")
+                }
+              >
+                {showDiff ? "Hide changes" : "Show changes"}
+              </button>
+            )}
+          </div>
         </div>
+
+        {editing && (
+          <div className="border-b border-emerald-100 bg-emerald-50 px-3 py-1.5 text-[11px] text-emerald-700">
+            ✏️ Editing — type directly to fix text, add or delete paragraphs. Changes
+            save automatically, export to DOCX, and the AI builds on them.
+          </div>
+        )}
 
         {/* rules referenced in the latest generation (grounded citations) */}
         {versions.length > 0 && ruleHits.length > 0 && (
@@ -2690,6 +2777,8 @@ export default function App() {
               note={currentNote}
               prev={prevNote}
               showDiff={showDiff && !!prevNote}
+              editing={editing}
+              edit={edit}
             />
           ) : (
             <p className="mt-20 text-center text-gray-400">
@@ -2781,58 +2870,167 @@ export default function App() {
 /* ------------------------------------------------------------------ *
  *  NOTE PREVIEW (styled CSIR TKDL format, with optional diff)
  * ------------------------------------------------------------------ */
-function NotePreview({ note, prev, showDiff }) {
+/* Auto-growing textarea used for editing paragraphs / closing line. */
+function AutoTextarea({ value, onChange, style, className, placeholder }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (el) {
+      el.style.height = "auto";
+      el.style.height = el.scrollHeight + "px";
+    }
+  }, [value]);
+  return (
+    <textarea
+      ref={ref}
+      value={value || ""}
+      placeholder={placeholder || ""}
+      onChange={onChange}
+      rows={1}
+      className={className}
+      style={style}
+    />
+  );
+}
+
+function NotePreview({ note, prev, showDiff, editing, edit }) {
   const labelStyle = { fontWeight: 700 };
+  const E = editing && edit ? edit : null;
+  const inputCls =
+    "w-full rounded border border-dashed border-gray-300 bg-yellow-50/40 px-1 focus:border-blue-400 focus:bg-white focus:outline-none";
+
+  // value that sits inline after a bold label (Subject / Ref / Date …)
+  const Inline = ({ field, value, style }) =>
+    E ? (
+      <input
+        value={value || ""}
+        onChange={(e) => E.setField(field, e.target.value)}
+        className={inputCls}
+        style={style}
+      />
+    ) : (
+      <>{value}</>
+    );
+
   return (
     <div className="mx-auto max-w-prose text-gray-900">
-      <p className="text-center font-bold" style={{ fontSize: "14pt" }}>
-        {note.header}
-      </p>
-      <p className="text-center font-bold" style={{ fontSize: "12pt" }}>
-        {note.department}
-      </p>
+      {E ? (
+        <input
+          value={note.header || ""}
+          onChange={(e) => E.setField("header", e.target.value)}
+          className={inputCls + " text-center font-bold"}
+          style={{ fontSize: "14pt" }}
+        />
+      ) : (
+        <p className="text-center font-bold" style={{ fontSize: "14pt" }}>
+          {note.header}
+        </p>
+      )}
+      {E ? (
+        <input
+          value={note.department || ""}
+          onChange={(e) => E.setField("department", e.target.value)}
+          className={inputCls + " mt-1 text-center font-bold"}
+          style={{ fontSize: "12pt" }}
+        />
+      ) : (
+        <p className="text-center font-bold" style={{ fontSize: "12pt" }}>
+          {note.department}
+        </p>
+      )}
       <hr className="my-3 border-t-2 border-gray-800" />
 
       <p style={{ fontSize: "11pt" }}>
         <span style={labelStyle}>DATE: </span>
-        {note.date}
+        <Inline field="date" value={note.date} />
       </p>
-      {note.hindiSubject ? (
+      {E || note.hindiSubject ? (
         <p style={{ fontSize: "11pt" }}>
           <span style={labelStyle}>विषय: </span>
-          {note.hindiSubject}
+          <Inline field="hindiSubject" value={note.hindiSubject} />
         </p>
       ) : null}
       <p style={{ fontSize: "11pt" }}>
         <span style={labelStyle}>Subject: </span>
-        {note.subject}
+        <Inline field="subject" value={note.subject} />
       </p>
       <p style={{ fontSize: "11pt" }}>
         <span style={labelStyle}>Ref: </span>
-        {note.reference}
+        <Inline field="reference" value={note.reference} />
       </p>
 
       <div className="mt-3 space-y-2">
-        {(note.paragraphs || []).map((p, i) => (
-          <p
-            key={i}
-            className="text-justify"
-            style={{ textIndent: "2em", fontSize: "11pt" }}
+        {(note.paragraphs || []).map((p, i) =>
+          E ? (
+            <div key={i}>
+              <AutoTextarea
+                value={p}
+                onChange={(e) => E.setParagraph(i, e.target.value)}
+                className={inputCls + " resize-none text-justify"}
+                style={{ fontSize: "11pt" }}
+              />
+              <div className="mt-0.5 flex gap-3 text-[10px] text-gray-400">
+                <button onClick={() => E.addParagraph(i)} className="hover:text-blue-600">
+                  + paragraph below
+                </button>
+                <button onClick={() => E.deleteParagraph(i)} className="hover:text-red-600">
+                  delete
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p
+              key={i}
+              className="text-justify"
+              style={{ textIndent: "2em", fontSize: "11pt" }}
+            >
+              {showDiff ? (
+                <DiffText oldStr={(prev.paragraphs || [])[i] || ""} newStr={p} />
+              ) : (
+                p
+              )}
+            </p>
+          )
+        )}
+        {E && (
+          <button
+            onClick={() => E.addParagraph((note.paragraphs || []).length - 1)}
+            className="text-[11px] text-blue-600 hover:underline"
           >
-            {showDiff ? (
-              <DiffText oldStr={(prev.paragraphs || [])[i] || ""} newStr={p} />
-            ) : (
-              p
-            )}
-          </p>
-        ))}
+            + Add paragraph
+          </button>
+        )}
       </div>
 
-      {(note.detailsBlock || []).length > 0 && (
+      {(note.detailsBlock || []).length > 0 || E ? (
         <div className="mt-3 space-y-1" style={{ fontSize: "11pt" }}>
-          {note.detailsBlock.map((d, i) => {
+          {(note.detailsBlock || []).map((d, i) => {
             const oldItem = (prev && prev.detailsBlock && prev.detailsBlock[i]) || {};
-            return (
+            return E ? (
+              <div key={i} className="flex items-center gap-1" style={{ paddingLeft: "2em" }}>
+                <input
+                  value={d.label || ""}
+                  onChange={(e) => E.setDetail(i, "label", e.target.value)}
+                  className={inputCls + " font-bold"}
+                  style={{ maxWidth: "45%" }}
+                  placeholder="Label"
+                />
+                <span>:</span>
+                <input
+                  value={d.value || ""}
+                  onChange={(e) => E.setDetail(i, "value", e.target.value)}
+                  className={inputCls}
+                  placeholder="Value"
+                />
+                <button
+                  onClick={() => E.deleteDetail(i)}
+                  className="text-[12px] text-gray-400 hover:text-red-600"
+                  title="Remove row"
+                >
+                  ×
+                </button>
+              </div>
+            ) : (
               <p key={i} style={{ paddingLeft: "2em" }}>
                 <span style={labelStyle}>{d.label} : </span>
                 {showDiff ? (
@@ -2843,21 +3041,48 @@ function NotePreview({ note, prev, showDiff }) {
               </p>
             );
           })}
+          {E && (
+            <button
+              onClick={() => E.addDetail()}
+              style={{ paddingLeft: "2em" }}
+              className="text-[11px] text-blue-600 hover:underline"
+            >
+              + Add detail row
+            </button>
+          )}
         </div>
-      )}
+      ) : null}
 
-      {note.closingLine ? (
+      {E ? (
+        <AutoTextarea
+          value={note.closingLine}
+          onChange={(e) => E.setField("closingLine", e.target.value)}
+          className={inputCls + " mt-4 resize-none"}
+          style={{ fontSize: "11pt" }}
+          placeholder="Closing line (optional)"
+        />
+      ) : note.closingLine ? (
         <p className="mt-4" style={{ fontSize: "11pt" }}>
           {note.closingLine}
         </p>
       ) : null}
 
       <div className="mt-6 space-y-3">
-        {(note.signatureChain || []).map((r, i) => (
-          <p key={i} style={{ fontSize: "11pt" }}>
-            {r}
-          </p>
-        ))}
+        {(note.signatureChain || []).map((r, i) =>
+          E ? (
+            <input
+              key={i}
+              value={r || ""}
+              onChange={(e) => E.setSignature(i, e.target.value)}
+              className={inputCls}
+              style={{ fontSize: "11pt" }}
+            />
+          ) : (
+            <p key={i} style={{ fontSize: "11pt" }}>
+              {r}
+            </p>
+          )
+        )}
       </div>
     </div>
   );
