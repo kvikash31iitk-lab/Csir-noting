@@ -77,6 +77,9 @@ const APP_SECRET =
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_ALLOWED_EMAILS = (process.env.GOOGLE_ALLOWED_EMAILS || "")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+// Google accounts that should sign in with the admin role.
+const GOOGLE_ADMIN_EMAILS = (process.env.GOOGLE_ADMIN_EMAILS || "")
+  .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 
 // Neutral, empty working dir so /generate has no project/code to "look at".
 const NEUTRAL_CWD =
@@ -372,7 +375,8 @@ app.post("/login/google", async (req, res) => {
     const credential = (req.body && req.body.credential) || "";
     if (!credential) return res.status(400).json({ error: "missing credential" });
     const email = await verifyGoogleCredential(credential);
-    const u = { username: email, role: "general" };
+    const role = GOOGLE_ADMIN_EMAILS.indexOf(email) !== -1 ? "admin" : "general";
+    const u = { username: email, role };
     res.json({ token: signToken(u), user: u });
   } catch (e) {
     res.status(401).json({ error: String((e && e.message) || e) });
