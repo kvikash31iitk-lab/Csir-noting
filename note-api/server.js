@@ -21,14 +21,31 @@
  */
 const express = require("express");
 const { spawn } = require("child_process");
+const os = require("os");
+const fs = require("fs");
+const path = require("path");
 
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "";
-const SYSTEM_PROMPT_FLAG = process.env.SYSTEM_PROMPT_FLAG || "--append-system-prompt";
+// Replace Claude Code's default coding-agent system prompt with the app's own
+// (use --append-system-prompt only if you explicitly want to keep the default).
+const SYSTEM_PROMPT_FLAG = process.env.SYSTEM_PROMPT_FLAG || "--system-prompt";
+const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || "1";
+// Pass --tools "" to disable all tools (pure text completion). Set
+// CLAUDE_DISABLE_TOOLS=0 to skip this if a CLI version doesn't accept it.
+const DISABLE_TOOLS = process.env.CLAUDE_DISABLE_TOOLS !== "0";
 const EXTRA_ARGS = (process.env.CLAUDE_EXTRA_ARGS || "").split(" ").filter(Boolean);
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "120000", 10);
+
+// Run claude in a neutral, empty directory so it has no project/code context
+// (no CLAUDE.md, no source files) to "look at" — it must answer from the prompt.
+const NEUTRAL_CWD =
+  process.env.CLAUDE_CWD || path.join(os.tmpdir(), "csir-note-api-cwd");
+try {
+  fs.mkdirSync(NEUTRAL_CWD, { recursive: true });
+} catch (_) {}
 
 const app = express();
 app.use(express.json({ limit: "8mb" }));
@@ -52,9 +69,13 @@ app.post("/generate", (req, res) => {
   if (!user) return res.status(400).json({ error: "missing 'user' prompt" });
 
   // Build the claude command. User prompt goes via stdin (handles large
-  // documents safely); system prompt via flag.
+  // documents safely); system prompt via flag. We run it as a single-turn,
+  // tool-less text completion so it returns the requested text/JSON rather than
+  // behaving as an interactive coding agent.
   const args = ["-p", "--output-format", "json"];
   if (system) args.push(SYSTEM_PROMPT_FLAG, system);
+  args.push("--max-turns", String(MAX_TURNS));
+  if (DISABLE_TOOLS) args.push("--tools", "");
   if (CLAUDE_MODEL) args.push("--model", CLAUDE_MODEL);
   args.push(...EXTRA_ARGS);
 
@@ -64,7 +85,7 @@ app.post("/generate", (req, res) => {
 
   let child;
   try {
-    child = spawn(CLAUDE_BIN, args, { env });
+    child = spawn(CLAUDE_BIN, args, { env, cwd: NEUTRAL_CWD });
   } catch (e) {
     return res.status(500).json({ error: "could not start claude: " + e.message });
   }
