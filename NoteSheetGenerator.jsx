@@ -1414,29 +1414,50 @@ export default function App() {
    *  FEATURE 2: SOURCE DOCUMENT PROCESSING
    * ============================================================== */
   async function handleSourceUpload(file) {
-    if (!file) return;
+    return handleSourceUploadMany(file ? [file] : []);
+  }
+
+  // Read one or more source documents, combine their text, and extract a single
+  // set of facts from everything together.
+  async function handleSourceUploadMany(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
     setSourceProcessing(true);
-    setSourceFilename(file.name);
-    let rawText = "";
-    try {
-      rawText = await readFileAsText(file, (m) => showToast(m, "info"));
-    } catch (e) {
+    let combined = "";
+    const names = [];
+    for (const file of files) {
+      try {
+        const text = await readFileAsText(file, (m) => showToast(m, "info"));
+        if (text && text.trim()) {
+          combined += (combined ? "\n\n" : "") + "===== " + file.name + " =====\n" + text;
+          names.push(file.name);
+        } else {
+          showToast(file.name + ": no readable text — skipped", "error");
+        }
+      } catch (e) {
+        showToast(
+          e && (e.code === "PDF_NO_TEXT" || e.code === "IMAGE_NO_TEXT")
+            ? file.name + ": no readable text (scanned?) — skipped"
+            : file.name + ": could not read — skipped",
+          "error"
+        );
+      }
+    }
+    if (!combined.trim()) {
       setSourceProcessing(false);
       setSourceFilename("");
-      showToast(
-        e && (e.code === "PDF_NO_TEXT" || e.code === "IMAGE_NO_TEXT")
-          ? "Couldn't read any text from this scan/image. Try a clearer scan, or upload the .docx (or text-based PDF) version."
-          : "Could not read this file. Please try a different .docx or .pdf file.",
-        "error"
-      );
+      showToast("No readable text in the selected file(s).", "error");
       return;
     }
+    const displayName =
+      names.length === 1 ? names[0] : names[0] + " + " + (names.length - 1) + " more";
+    setSourceFilename(displayName);
 
     try {
       const sys =
-        "You are extracting structured facts from a government office document. Return only raw JSON with no markdown, no backticks, no preamble.";
+        "You are extracting structured facts from one or more government office documents. Return only raw JSON with no markdown, no backticks, no preamble.";
       const userMsg =
-        "Extract all key facts from this document and return this exact JSON structure:\n" +
+        "Extract all key facts from the document(s) below and return this exact JSON structure:\n" +
         "{\n" +
         "  subject: one-line subject suitable for an office noting,\n" +
         "  date: date found in document or todays date,\n" +
@@ -1451,7 +1472,7 @@ export default function App() {
         "  additionalFacts: object with any other important key-value facts\n" +
         "}\n" +
         "Document text: " +
-        rawText;
+        combined;
       const resp = await callClaude(sys, userMsg);
       const parsed = parseJSON(resp);
       if (!parsed) {
@@ -1462,8 +1483,14 @@ export default function App() {
       const normalized = normalizeFacts(parsed);
       setFacts(normalized);
       setFactCardHidden(false);
-      persistSession({ extractedFacts: normalized, sourceFilename: file.name });
-      showToast("Facts extracted — please verify above", "success");
+      persistSession({ extractedFacts: normalized, sourceFilename: displayName });
+      showToast(
+        names.length +
+          " document" +
+          (names.length > 1 ? "s" : "") +
+          " read — facts extracted, please verify",
+        "success"
+      );
     } catch (e) {
       showToast("AI call failed — please retry", "error");
     } finally {
@@ -2552,8 +2579,8 @@ export default function App() {
               onDrop={(e) => {
                 e.preventDefault();
                 setDragOver(false);
-                const f = e.dataTransfer.files && e.dataTransfer.files[0];
-                if (f) handleSourceUpload(f);
+                const fs = e.dataTransfer.files;
+                if (fs && fs.length) handleSourceUploadMany(fs);
               }}
               className={
                 "flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-4 text-center transition-all duration-200 " +
@@ -2565,10 +2592,11 @@ export default function App() {
               <input
                 type="file"
                 accept={UPLOAD_ACCEPT}
+                multiple
                 className="hidden"
                 onChange={(e) => {
-                  const f = e.target.files && e.target.files[0];
-                  if (f) handleSourceUpload(f);
+                  const fs = e.target.files;
+                  if (fs && fs.length) handleSourceUploadMany(fs);
                   e.target.value = "";
                 }}
               />
@@ -2580,7 +2608,7 @@ export default function App() {
                 <>
                   <span className="text-2xl">📥</span>
                   <span className="mt-1 text-xs text-gray-500">
-                    Drag &amp; drop or click to upload
+                    Drag &amp; drop or click — you can select several files
                   </span>
                   <span className="text-[10px] text-gray-400">
                     Word · PDF · Excel · scanned image
