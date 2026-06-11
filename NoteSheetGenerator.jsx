@@ -680,6 +680,9 @@ export default function App() {
   const [editing, setEditing] = useState(false);
   const [docStyle, setDocStyle] = useState(DEFAULT_DOC_STYLE);
   const [showStyle, setShowStyle] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
   const [tabOffset, setTabOffset] = useState(0);
   const [activePanel, setActivePanel] = useState("library"); // mobile: which column is shown
   // On wide screens we show all three columns at once; on phones we show one
@@ -1991,6 +1994,82 @@ export default function App() {
     storageSet("cfg:docStyle", next, true);
   }
 
+  /* ---- note history: save the current note and start a fresh one ---- */
+  async function startNewNote() {
+    const cur = versions[activeVersion];
+    if (cur && apiBase() && apiToken()) {
+      try {
+        const firstInstr =
+          (chatHistory.find((c) => c.role === "user") || {}).text || "";
+        await api.addNote({
+          title: cur.subject || "Untitled note",
+          instructions: firstInstr,
+          draft: JSON.stringify(cur),
+          final: JSON.stringify(cur),
+        });
+      } catch (e) {
+        /* non-fatal — still start fresh */
+      }
+    }
+    sessionIdRef.current = generateUUID();
+    setVersions([]);
+    setActiveVersion(0);
+    setChatHistory([]);
+    setChatInput("");
+    setFacts(null);
+    setSourceFilename("");
+    setFactCardHidden(false);
+    setEditing(false);
+    setRuleHits([]);
+    await storageSet("session:current", { sessionId: sessionIdRef.current }, false);
+    showToast(cur ? "Saved to history — new note started ✓" : "New note started", "success");
+  }
+
+  async function openHistory() {
+    if (!apiBase() || !apiToken()) {
+      showToast("Sign in to view saved notes", "error");
+      return;
+    }
+    setShowHistory(true);
+    setLoadingHistory(true);
+    try {
+      const brain = await api.getBrain();
+      const notes = Array.isArray(brain.notes) ? brain.notes.slice().reverse() : [];
+      setHistory(notes);
+    } catch (e) {
+      showToast("Could not load history", "error");
+    } finally {
+      setLoadingHistory(false);
+    }
+  }
+
+  function loadHistoryNote(item) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(item.final || item.draft || "null");
+    } catch (e) {}
+    if (!parsed) {
+      showToast("Could not open this note", "error");
+      return;
+    }
+    const note = normalizeNote(parsed) || parsed;
+    const chat = [
+      { role: "ai", text: "Loaded from history. Refine it by typing below.", version: 1 },
+    ];
+    sessionIdRef.current = generateUUID();
+    setVersions([note]);
+    setActiveVersion(0);
+    setChatHistory(chat);
+    setChatInput("");
+    setFacts(null);
+    setFactCardHidden(true);
+    setEditing(false);
+    setRuleHits([]);
+    setShowHistory(false);
+    persistSession({ versions: [note], activeVersion: 0, chatHistory: chat });
+    showToast("Note loaded ✓", "success");
+  }
+
   /* ---- inline editing (Phase A): write manual edits back into the active
    * version so the AI, the DOCX export and the session all stay in sync. ---- */
   function updateActiveNote(mutator) {
@@ -2520,8 +2599,24 @@ export default function App() {
           " w-full flex-col border-r border-gray-200 bg-white md:w-2/5"
         }
       >
-        <div className="border-b border-gray-200 p-4">
+        <div className="flex items-center justify-between border-b border-gray-200 p-4">
           <h2 className="text-lg font-bold">💬 Note Instructions</h2>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={openHistory}
+              className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-600 transition-colors hover:bg-gray-200"
+              title="View and reopen saved notes"
+            >
+              🕘 History
+            </button>
+            <button
+              onClick={startNewNote}
+              className="rounded bg-blue-600 px-2 py-1 text-xs font-medium text-white transition-colors hover:bg-blue-700"
+              title="Save the current note to history and start a fresh one"
+            >
+              ＋ New Note
+            </button>
+          </div>
         </div>
 
         {/* Fact Card */}
@@ -2958,6 +3053,54 @@ export default function App() {
           </button>
         ))}
       </nav>
+      )}
+
+      {/* ===================== HISTORY MODAL ===================== */}
+      {showHistory && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={() => setShowHistory(false)}
+        >
+          <div
+            className="max-h-[80vh] w-full max-w-lg overflow-y-auto rounded-xl bg-white p-4 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-base font-bold">🕘 Saved Notes</h3>
+              <button
+                onClick={() => setShowHistory(false)}
+                className="rounded px-2 text-gray-400 hover:bg-gray-100"
+              >
+                ✕
+              </button>
+            </div>
+            {loadingHistory ? (
+              <p className="py-6 text-center text-sm text-gray-400">Loading…</p>
+            ) : history.length === 0 ? (
+              <p className="py-6 text-center text-sm text-gray-400">
+                No saved notes yet. They appear here after you generate or start a new note.
+              </p>
+            ) : (
+              <ul className="space-y-2">
+                {history.map((h) => (
+                  <li key={h.id}>
+                    <button
+                      onClick={() => loadHistoryNote(h)}
+                      className="w-full rounded-lg border border-gray-200 p-2 text-left transition-colors hover:border-blue-400 hover:bg-blue-50/40"
+                    >
+                      <p className="truncate text-sm font-medium text-gray-800">
+                        {h.title || "Untitled note"}
+                      </p>
+                      <p className="text-[11px] text-gray-400">
+                        {h.addedAt ? new Date(h.addedAt).toLocaleString() : ""}
+                      </p>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
       )}
 
       {/* ===================== TOASTS ===================== */}
