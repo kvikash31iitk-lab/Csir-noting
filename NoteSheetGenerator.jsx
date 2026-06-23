@@ -134,20 +134,35 @@ function generateUUID() {
 
 /** Strip markdown code-fences then JSON.parse. Returns null on failure. */
 function parseJSON(text) {
-  try {
-    if (typeof text !== "string") return null;
-    let cleaned = text.trim();
-    // remove leading/trailing ``` fences (```json ... ```)
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-    // if there is still a fenced block somewhere, grab the first {...}
-    if (cleaned[0] !== "{" && cleaned[0] !== "[") {
-      const m = cleaned.match(/[{[][\s\S]*[}\]]/);
-      if (m) cleaned = m[0];
+  if (typeof text !== "string") return null;
+  let cleaned = text
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
+  const tryParse = (s) => {
+    try {
+      return JSON.parse(s);
+    } catch (e) {
+      return undefined;
     }
-    return JSON.parse(cleaned);
-  } catch (e) {
-    return null;
+  };
+  const stripTrailingCommas = (s) => s.replace(/,\s*([}\]])/g, "$1");
+
+  // 1) straight parse
+  let r = tryParse(cleaned);
+  if (r !== undefined) return r;
+  // 2) tolerate trailing commas
+  r = tryParse(stripTrailingCommas(cleaned));
+  if (r !== undefined) return r;
+  // 3) the model added prose before/after the JSON — grab the {...}/[...] region
+  const m = cleaned.match(/[{[][\s\S]*[}\]]/);
+  if (m) {
+    r = tryParse(m[0]);
+    if (r !== undefined) return r;
+    r = tryParse(stripTrailingCommas(m[0]));
+    if (r !== undefined) return r;
   }
+  return null;
 }
 
 /* ---- window.storage wrappers (all async, all guarded) ---- */
@@ -227,6 +242,23 @@ async function callClaude(systemPrompt, userMessage) {
   const data = await res.json();
   const block = data && data.content && data.content[0];
   return block && block.text ? block.text : "";
+}
+
+/* Call Claude and parse JSON, retrying a couple of times on a transient error
+ * or an unparseable response. Returns the parsed object, or null. */
+async function callClaudeJSON(systemPrompt, userMessage, attempts) {
+  attempts = attempts || 3;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const resp = await callClaude(systemPrompt, userMessage);
+      const parsed = parseJSON(resp);
+      if (parsed) return parsed;
+    } catch (e) {
+      /* transient — fall through to retry */
+    }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 700));
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1473,8 +1505,7 @@ export default function App() {
         "}\n" +
         "Document text: " +
         combined;
-      const resp = await callClaude(sys, userMsg);
-      const parsed = parseJSON(resp);
+      const parsed = await callClaudeJSON(sys, userMsg, 3);
       if (!parsed) {
         showToast("AI call failed — please retry", "error");
         setSourceProcessing(false);
@@ -1669,8 +1700,7 @@ export default function App() {
           ". Use signature chain: " +
           JSON.stringify(chain) +
           ".";
-      const resp = await callClaude(sys, userMsg);
-      const note = normalizeNote(parseJSON(resp));
+      const note = normalizeNote(await callClaudeJSON(sys, userMsg, 3));
       if (!note) {
         showToast("AI call failed — please retry", "error");
         setGenerating(false);
@@ -1754,8 +1784,7 @@ export default function App() {
         ". New instruction: " +
         msg +
         ". Return the complete updated note as JSON applying only the requested change. Do not alter anything that was not mentioned in the new instruction.";
-      const resp = await callClaude(sys, userMsg);
-      const note = normalizeNote(parseJSON(resp));
+      const note = normalizeNote(await callClaudeJSON(sys, userMsg, 3));
       if (!note) {
         showToast("AI call failed — please retry", "error");
         setAiTyping(false);
