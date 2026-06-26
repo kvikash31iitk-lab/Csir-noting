@@ -1,0 +1,5 @@
+# Never commit the datastore (contains real government document text) or secrets.
+data/
+*.bak
+.env
+node_modules/

@@ -1670,6 +1670,12 @@ export default function App() {
       showToast("Type what the note should say, then Send", "error");
       return;
     }
+    // Generation now requires a signed-in session (the backend authenticates /generate).
+    if (apiBase() && !apiToken()) {
+      showToast("Please sign in (top of Library) to generate", "error");
+      setShowLogin(true);
+      return;
+    }
     setEditing(false);
     setGenerating(true);
     try {
@@ -1755,6 +1761,12 @@ export default function App() {
     // if no note yet, the send acts as generation trigger
     if (versions.length === 0) {
       await handleGenerate();
+      return;
+    }
+
+    if (apiBase() && !apiToken()) {
+      showToast("Please sign in (top of Library) to generate", "error");
+      setShowLogin(true);
       return;
     }
 

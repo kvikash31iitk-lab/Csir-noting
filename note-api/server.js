@@ -81,6 +81,20 @@ const GOOGLE_ALLOWED_EMAILS = (process.env.GOOGLE_ALLOWED_EMAILS || "")
 const GOOGLE_ADMIN_EMAILS = (process.env.GOOGLE_ADMIN_EMAILS || "")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 
+// --- startup security warnings (loud, but non-fatal so the app never bricks) ---
+if (!process.env.USERS) {
+  console.warn(
+    "[SECURITY] Using built-in default users (vikash/vikash, admin/admin1). " +
+    "Set the USERS env var to strong credentials in production."
+  );
+}
+if (!process.env.APP_SECRET) {
+  console.warn(
+    "[SECURITY] APP_SECRET is unset and is being DERIVED from the user list — " +
+    "tokens are forgeable from the source. Set APP_SECRET=$(openssl rand -hex 32)."
+  );
+}
+
 // Neutral, empty working dir so /generate has no project/code to "look at".
 const NEUTRAL_CWD =
   process.env.CLAUDE_CWD || path.join(os.tmpdir(), "csir-note-api-cwd");
@@ -260,9 +274,36 @@ function runClaude({ args, stdin, cwd, timeoutMs }) {
 }
 
 /* ------------------------------------------------------------------ *
+ *  Simple in-memory per-IP rate limiter (no external dependency)
+ * ------------------------------------------------------------------ */
+const _rlBuckets = new Map();
+function rateLimit(opts) {
+  const windowMs = opts.windowMs;
+  const max = opts.max;
+  return (req, res, next) => {
+    const id = (req.ip || (req.headers["x-forwarded-for"] || "").split(",")[0] || "unknown").trim();
+    const now = Date.now();
+    let b = _rlBuckets.get(id);
+    if (!b || now - b.start >= windowMs) { b = { start: now, count: 0 }; _rlBuckets.set(id, b); }
+    b.count++;
+    if (b.count > max) {
+      res.setHeader("Retry-After", String(Math.ceil((b.start + windowMs - now) / 1000)));
+      return res.status(429).json({ error: "too many requests — please slow down" });
+    }
+    next();
+  };
+}
+const _rlCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _rlBuckets) if (now - v.start > 600000) _rlBuckets.delete(k);
+}, 600000);
+if (_rlCleanup.unref) _rlCleanup.unref();
+
+/* ------------------------------------------------------------------ *
  *  HTTP app
  * ------------------------------------------------------------------ */
 const app = express();
+app.set("trust proxy", 1); // behind nginx — use X-Forwarded-For for req.ip
 app.use(express.json({ limit: "30mb" })); // large enough for base64 scans
 
 app.use((req, res, next) => {
@@ -277,8 +318,8 @@ app.use((req, res, next) => {
 app.get("/health", (_req, res) =>
   res.json({ ok: true, users: USERS.length, google: !!GOOGLE_CLIENT_ID }));
 
-// --- generation (unchanged behaviour) ---
-app.post("/generate", async (req, res) => {
+// --- generation (now authenticated + rate-limited; was previously open) ---
+app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, async (req, res) => {
   const body = req.body || {};
   const system = typeof body.system === "string" ? body.system : "";
   const user = typeof body.user === "string" ? body.user : "";
@@ -293,12 +334,19 @@ app.post("/generate", async (req, res) => {
     const text = await runClaude({ args, stdin: user, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS });
     res.json({ content: [{ type: "text", text }] });
   } catch (e) {
-    res.status(500).json({ error: String((e && e.message) || e) });
+    console.error("[generate] error:", (e && e.stack) || e);
+    const msg = String((e && e.message) || e);
+    // Surface quota/limit distinctly so the UI can tell the operator; never leak stderr.
+    if (/limit|quota|usage|429|rate/i.test(msg))
+      return res.status(429).json({ error: "AI usage limit reached — try again later", code: "quota" });
+    if (/timed out/i.test(msg))
+      return res.status(504).json({ error: "AI timed out — try a shorter note", code: "timeout" });
+    res.status(500).json({ error: "generation failed", code: "error" });
   }
 });
 
 // --- OCR via Claude vision (Read tool on a temp file) ---
-app.post("/extract", requireAuth, async (req, res) => {
+app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async (req, res) => {
   const b = req.body || {};
   let raw = b.dataUrl || b.imageBase64 || b.base64 || "";
   let mime = b.mimeType || "";
@@ -336,7 +384,8 @@ app.post("/extract", requireAuth, async (req, res) => {
     });
     res.json({ text: String(text || "").trim() });
   } catch (e) {
-    res.status(500).json({ error: "ocr failed: " + String((e && e.message) || e) });
+    console.error("[extract] error:", (e && e.stack) || e);
+    res.status(500).json({ error: "ocr failed" });
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
   }
@@ -351,7 +400,7 @@ app.get("/auth/config", (_req, res) => {
   });
 });
 
-app.post("/login", (req, res) => {
+app.post("/login", rateLimit({ windowMs: 60000, max: 10 }), (req, res) => {
   const b = req.body || {};
   const username = String(b.username || "").trim();
   const password = String(b.password || "");

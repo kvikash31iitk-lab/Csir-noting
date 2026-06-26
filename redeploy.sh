@@ -40,13 +40,13 @@ if [ -f "$APIDIR/server.js" ] && ! diff -q "$REPO/note-api/server.js" "$APIDIR/s
   cp "$REPO/note-api/server.js" "$APIDIR/server.js"
   pm2 restart note-api >/dev/null 2>&1 || true
   sleep 3
-  GEN=$(curl -sS -X POST http://127.0.0.1:8787/generate \
-        -H 'content-type: application/json' \
-        -d '{"system":"Return ONLY this JSON: {\"ok\":true}","user":"go"}' || true)
-  if echo "$GEN" | grep -q '"ok"' && ! echo "$GEN" | grep -q '"error"'; then
-    echo "    backend OK — kept"
+  # Smoke-test the unauthenticated /health (does NOT spend the Claude subscription,
+  # and /generate now requires auth so it must not be used here).
+  HC=$(curl -sS http://127.0.0.1:8787/health || true)
+  if echo "$HC" | grep -q '"ok":true'; then
+    echo "    backend OK — kept ($HC)"
   else
-    echo "    backend FAILED — reverting. Response: $GEN"
+    echo "    backend FAILED to start — reverting. Response: $HC"
     cp "$APIDIR/server.js.bak" "$APIDIR/server.js"
     pm2 restart note-api >/dev/null 2>&1 || true
   fi

@@ -199,10 +199,17 @@
         (body.messages && body.messages[0] && body.messages[0].content) || "";
 
       // 1) BACKEND mode — uses your Claude subscription via your server.
+      //    The backend now REQUIRES auth on /generate, so attach the login token.
       if (backend) {
+        var noteToken = "";
+        try {
+          noteToken = localStorage.getItem("cfg::noteToken") || "";
+        } catch (e) {}
+        var bHeaders = { "content-type": "application/json" };
+        if (noteToken) bHeaders["authorization"] = "Bearer " + noteToken;
         return realFetch(backend, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: bHeaders,
           body: JSON.stringify({ system: sysP, user: userP }),
         });
       }
