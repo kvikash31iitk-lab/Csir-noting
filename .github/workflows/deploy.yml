@@ -5,6 +5,13 @@ name: Deploy to VPS
 # The VPS never needs to pull from GitHub, so no repo visibility toggling.
 on:
   workflow_dispatch:
+  push:
+    branches: [claude/note-sheet-generator-app-tbVN7]
+    paths:
+      - "NoteSheetGenerator.jsx"
+      - "android-app/**"
+      - "note-api/server.js"
+      - ".github/workflows/deploy.yml"
 
 concurrency:
   group: deploy-vps
