@@ -126,7 +126,15 @@ const newId = () => crypto.randomBytes(8).toString("hex");
  * headings where possible and otherwise packs ~1200-char windows. */
 function chunkRuleText(text) {
   const clean = String(text).replace(/\r/g, "");
-  const paras = clean.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
+  // Split into paragraphs, then HARD-split any paragraph longer than ~1500 chars
+  // (scanned/PDF rulebooks often have almost no blank lines -> one giant block).
+  const paras = [];
+  for (let p of clean.split(/\n{2,}/)) {
+    p = p.trim();
+    if (!p) continue;
+    while (p.length > 1500) { paras.push(p.slice(0, 1500)); p = p.slice(1500); }
+    paras.push(p);
+  }
   const headRe =
     /\b(Rule|Section|Para(?:graph)?|Article|Clause|Regulation|GFR|FR|SR)\s+([0-9]+[A-Za-z()\-.]*)/i;
   const chunks = [];
@@ -325,13 +333,20 @@ app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, asyn
   const user = typeof body.user === "string" ? body.user : "";
   if (!user) return res.status(400).json({ error: "missing 'user' prompt" });
 
-  const args = ["-p", "--output-format", "json"];
-  if (system) args.push(SYSTEM_PROMPT_FLAG, system);
+  // Keep a SMALL fixed system prompt on the CLI (to replace Claude's coding-agent
+  // default) and move the caller's possibly-huge system prompt into STDIN, so a
+  // large rule/context payload can never overflow the OS arg limit (E2BIG).
+  const BASE_SYSTEM =
+    "You are a precise writing assistant for Indian government office notings. " +
+    "Follow the instructions in the user message exactly and output ONLY what is " +
+    "requested (raw JSON when asked) — no preamble, no markdown, no code fences.";
+  const args = ["-p", "--output-format", "json", SYSTEM_PROMPT_FLAG, BASE_SYSTEM];
   args.push("--max-turns", String(MAX_TURNS));
   if (DISABLE_TOOLS) args.push("--tools", "");
+  const combined = system ? system + "\n\n=====\n\n" + user : user;
 
   try {
-    const text = await runClaude({ args, stdin: user, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS });
+    const text = await runClaude({ args, stdin: combined, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS });
     res.json({ content: [{ type: "text", text }] });
   } catch (e) {
     console.error("[generate] error:", (e && e.stack) || e);

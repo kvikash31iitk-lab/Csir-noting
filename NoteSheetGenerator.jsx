@@ -1585,14 +1585,20 @@ export default function App() {
       const results = (out && out.results) || [];
       if (!results.length) return "";
       setRuleHits(results);
+      // Cap each provision and the total, so a huge rulebook can never bloat the
+      // prompt (belt-and-braces with the backend's stdin handling).
+      const PER = 1800, TOTAL = 12000;
       const blocks = results.map(
         (r, i) =>
           "[" + (i + 1) + "] " + (r.ruleName || "Rule") +
-          (r.label ? " — " + r.label : "") + ":\n" + r.text
+          (r.label ? " — " + r.label : "") + ":\n" +
+          String(r.text || "").slice(0, PER)
       );
+      let ctx = blocks.join("\n\n");
+      if (ctx.length > TOTAL) ctx = ctx.slice(0, TOTAL) + " …[truncated]";
       return (
         ". The following official rule provisions were retrieved from the office rule library and are AUTHORITATIVE. When the note relies on a rule, cite it EXACTLY as written here (e.g. 'GFR 2017 Rule 21') and never invent rule numbers. If none are relevant, do not cite any. Provisions:\n" +
-        blocks.join("\n\n")
+        ctx
       );
     } catch (e) {
       return ""; // retrieval is best-effort; never block generation
