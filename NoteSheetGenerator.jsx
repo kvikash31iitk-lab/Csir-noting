@@ -20,9 +20,10 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 /* ------------------------------------------------------------------ *
  *  CONSTANTS
  * ------------------------------------------------------------------ */
-const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
-const CLAUDE_MODEL = "claude-sonnet-4-20250514";
-const CLAUDE_MAX_TOKENS = 2000;
+// Generation is NOT done directly against api.anthropic.com (that needs a
+// secret API key and is blocked by CORS from the browser). Instead we call the
+// note-api backend's /generate endpoint, which runs the `claude` CLI on the
+// server against the Max subscription. The model/token limits live there.
 
 const MAMMOTH_CDN =
   "https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js";
@@ -221,25 +222,15 @@ async function storageDelete(key, shared = false) {
   }
 }
 
-/** Call Claude messages API. Throws on failure (callers must try/catch). */
+/** Generate text via the note-api backend (/generate runs the `claude` CLI on
+ *  the server, billed to the Max subscription). apiFetch attaches the Bearer
+ *  token, clears it on 401, and surfaces quota/timeout errors from the server.
+ *  Throws on failure (callers must try/catch). */
 async function callClaude(systemPrompt, userMessage) {
-  const res = await fetch(CLAUDE_URL, {
+  const data = await apiFetch("/generate", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: CLAUDE_MAX_TOKENS,
-      system: systemPrompt,
-      messages: [{ role: "user", content: userMessage }],
-    }),
+    body: JSON.stringify({ system: systemPrompt, user: userMessage }),
   });
-  if (!res.ok) {
-    throw new Error("Claude API HTTP " + res.status);
-  }
-  const data = await res.json();
   const block = data && data.content && data.content[0];
   return block && block.text ? block.text : "";
 }
