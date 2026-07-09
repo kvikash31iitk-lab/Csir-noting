@@ -52,6 +52,21 @@ Real AI generation requires the `note-api` backend to be running with
 `OPENAI_API_KEY` configured. Document reading, DOCX export, library learning UI,
 versioning, and diff view work in the local harness regardless.
 
+## Local ChatGPT Subscription Mode
+
+If you want to use your ChatGPT web subscription instead of an OpenAI API key,
+run the local browser bridge on your own PC:
+
+```powershell
+cd "C:\Users\HP\VIkash\Data bento\Csir-noting\chatgpt-bridge"
+npm.cmd install
+npm.cmd start
+```
+
+Then set the app Backend URL to `http://localhost:8790/generate` or click
+`Local ChatGPT` in the settings panel. This mode is local-only and depends on a
+visible browser logged in to ChatGPT.
+
 ## Using the app
 
 1. (Optional) Add one or more **reference notings** to improve output quality.

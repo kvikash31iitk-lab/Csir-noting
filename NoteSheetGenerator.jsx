@@ -293,6 +293,16 @@ function apiBase() {
     return "";
   }
 }
+function isLocalBridgeBackend() {
+  const base = apiBase();
+  if (!base) return false;
+  try {
+    const host = new URL(base).hostname;
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch (_) {
+    return false;
+  }
+}
 function apiToken() {
   try {
     return localStorage.getItem("cfg::noteToken") || "";
@@ -1695,7 +1705,7 @@ export default function App() {
       return;
     }
     // Generation now requires a signed-in session (the backend authenticates /generate).
-    if (apiBase() && !apiToken()) {
+    if (apiBase() && !apiToken() && !isLocalBridgeBackend()) {
       showToast("Please sign in (top of Library) to generate", "error");
       setShowLogin(true);
       return;
@@ -1788,7 +1798,7 @@ export default function App() {
       return;
     }
 
-    if (apiBase() && !apiToken()) {
+    if (apiBase() && !apiToken() && !isLocalBridgeBackend()) {
       showToast("Please sign in (top of Library) to generate", "error");
       setShowLogin(true);
       return;

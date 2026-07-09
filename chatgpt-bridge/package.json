@@ -1,0 +1,14 @@
+{
+  "name": "csir-chatgpt-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local-only ChatGPT browser automation bridge for CSIR Note Sheet.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "install-browser": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.45.3"
+  }
+}

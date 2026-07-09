@@ -322,10 +322,11 @@
         ';">' +
         mode +
         " (If Backend URL is set, it takes priority; blank both = demo.)</p>" +
-        '<div style="display:flex;gap:8px;">' +
-        '<button id="ck_save" style="flex:1;padding:8px;border:none;border-radius:8px;background:#2563eb;color:#fff;font-weight:600;cursor:pointer;">Save</button>' +
-        '<button id="ck_clear" style="flex:1;padding:8px;border:none;border-radius:8px;background:#f3f4f6;color:#374151;cursor:pointer;">Use demo</button>' +
-        '<button id="ck_close" style="flex:1;padding:8px;border:none;border-radius:8px;background:#f3f4f6;color:#374151;cursor:pointer;">Cancel</button>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+        '<button id="ck_save" style="flex:1 1 45%;padding:8px;border:none;border-radius:8px;background:#2563eb;color:#fff;font-weight:600;cursor:pointer;">Save</button>' +
+        '<button id="ck_local" style="flex:1 1 45%;padding:8px;border:none;border-radius:8px;background:#111827;color:#fff;font-weight:600;cursor:pointer;">Local ChatGPT</button>' +
+        '<button id="ck_clear" style="flex:1 1 45%;padding:8px;border:none;border-radius:8px;background:#f3f4f6;color:#374151;cursor:pointer;">Use demo</button>' +
+        '<button id="ck_close" style="flex:1 1 45%;padding:8px;border:none;border-radius:8px;background:#f3f4f6;color:#374151;cursor:pointer;">Cancel</button>' +
         "</div>";
       overlay.appendChild(card);
       document.body.appendChild(overlay);
@@ -335,6 +336,11 @@
       card.querySelector("#ck_save").onclick = function () {
         setBackend(card.querySelector("#ck_backend").value.trim());
         setKey(card.querySelector("#ck_key").value.trim());
+        location.reload();
+      };
+      card.querySelector("#ck_local").onclick = function () {
+        setBackend("http://localhost:8790/generate");
+        setKey("");
         location.reload();
       };
       card.querySelector("#ck_clear").onclick = function () {
