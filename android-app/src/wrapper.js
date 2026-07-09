@@ -1,10 +1,10 @@
 /* =====================================================================
  *  DEVICE WRAPPER  (runs before the React bundle)
  *  - window.storage  -> backed by localStorage (persists on the phone)
- *  - window.fetch    -> if an API key is saved, calls the real Anthropic
+ *  - window.fetch    -> if an API key is saved, calls the OpenAI Responses
  *                       API; otherwise returns realistic DEMO responses so
  *                       the app fully works offline out of the box.
- *  - A small ⚙ button lets the user paste/clear their Anthropic API key.
+ *  - A small settings button lets the user paste/clear their OpenAI API key.
  * ===================================================================== */
 (function () {
   /* ---------------- storage shim ---------------- */
@@ -42,15 +42,15 @@
   /* ---------------- API key + backend helpers ---------------- */
   function getKey() {
     try {
-      return localStorage.getItem("cfg::anthropicKey") || "";
+      return localStorage.getItem("cfg::openaiKey") || "";
     } catch (e) {
       return "";
     }
   }
   function setKey(k) {
     try {
-      if (k) localStorage.setItem("cfg::anthropicKey", k);
-      else localStorage.removeItem("cfg::anthropicKey");
+      if (k) localStorage.setItem("cfg::openaiKey", k);
+      else localStorage.removeItem("cfg::openaiKey");
     } catch (e) {}
   }
   function getBackend() {
@@ -182,11 +182,27 @@
     return DEMO_NOTE_V1;
   }
 
+  function openAITextFromResponse(data) {
+    if (data && typeof data.output_text === "string") return data.output_text;
+    var chunks = [];
+    var output = (data && data.output) || [];
+    for (var i = 0; i < output.length; i++) {
+      var content = output[i].content || [];
+      for (var j = 0; j < content.length; j++) {
+        if (typeof content[j].text === "string") chunks.push(content[j].text);
+        else if (typeof content[j].output_text === "string") chunks.push(content[j].output_text);
+      }
+    }
+    return chunks.join("\n").trim();
+  }
+
   /* ---------------- fetch override ---------------- */
   var realFetch = window.fetch.bind(window);
   window.fetch = function (url, opts) {
     opts = opts || {};
     var u = typeof url === "string" ? url : (url && url.url) || "";
+    // The React artifact still emits the old messages endpoint; intercept it
+    // here and route the request to the configured ChatGPT/OpenAI path.
     if (u.indexOf("api.anthropic.com") !== -1) {
       var backend = getBackend();
       var key = getKey();
@@ -198,7 +214,7 @@
       var userP =
         (body.messages && body.messages[0] && body.messages[0].content) || "";
 
-      // 1) BACKEND mode — uses your Claude subscription via your server.
+      // 1) BACKEND mode - uses ChatGPT/OpenAI via your server.
       //    The backend now REQUIRES auth on /generate, so attach the login token.
       if (backend) {
         var noteToken = "";
@@ -216,13 +232,38 @@
 
       // 2) API-KEY mode — direct call with the user's key.
       if (key) {
-        var headers = Object.assign({}, opts.headers || {}, {
-          "x-api-key": key,
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
-          "content-type": "application/json",
+        return realFetch("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer " + key,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            instructions: sysP,
+            input: userP,
+            max_output_tokens: body.max_tokens || 2000,
+            store: false,
+          }),
+        }).then(function (resp) {
+          return resp.text().then(function (txt) {
+            var data = null;
+            try {
+              data = txt ? JSON.parse(txt) : null;
+            } catch (e) {}
+            if (!resp.ok) {
+              return new Response(txt || JSON.stringify({ error: "OpenAI request failed" }), {
+                status: resp.status,
+                headers: { "Content-Type": "application/json" },
+              });
+            }
+            var text = openAITextFromResponse(data);
+            return new Response(
+              JSON.stringify({ content: [{ type: "text", text: text }] }),
+              { status: 200, headers: { "Content-Type": "application/json" } }
+            );
+          });
         });
-        return realFetch(url, Object.assign({}, opts, { headers: headers }));
       }
 
       // 3) DEMO mode — built-in sample responses, fully offline.
@@ -257,21 +298,23 @@
       var key = getKey();
       var backend = getBackend();
       var mode = backend
-        ? "✓ Using your Claude subscription (backend)."
+        ? "Using ChatGPT/OpenAI backend."
         : key
-        ? "✓ Using your Anthropic API key."
+        ? "Using your OpenAI API key."
         : "Currently running in demo mode.";
+      if (backend) mode = "Using ChatGPT/OpenAI backend.";
+      else if (key) mode = "Using your OpenAI API key.";
       card.innerHTML =
         '<h3 style="margin:0 0 8px;font-size:16px;font-weight:700;">AI Settings</h3>' +
         '<p style="margin:0 0 6px;font-size:12px;color:#555;line-height:1.4;">' +
         "Choose how the app writes notes. Both fields are stored only on this device." +
         "</p>" +
-        '<label style="font-size:11px;font-weight:600;color:#374151;">Backend URL — uses your Claude subscription (recommended)</label>' +
+        '<label style="font-size:11px;font-weight:600;color:#374151;">Backend URL - uses ChatGPT/OpenAI on your server (recommended)</label>' +
         '<input id="ck_backend" type="text" placeholder="https://noteapi.cheetsheet.tech/generate" value="' +
         (backend ? backend.replace(/"/g, "&quot;") : "") +
         '" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:8px;font-size:13px;margin:4px 0 10px;"/>' +
-        '<label style="font-size:11px;font-weight:600;color:#374151;">…or Anthropic API key (pay-as-you-go)</label>' +
-        '<input id="ck_key" type="password" placeholder="sk-ant-..." value="' +
+        '<label style="font-size:11px;font-weight:600;color:#374151;">or OpenAI API key (pay-as-you-go)</label>' +
+        '<input id="ck_key" type="password" placeholder="sk-..." value="' +
         (key ? key.replace(/"/g, "&quot;") : "") +
         '" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:8px;font-size:13px;margin:4px 0 6px;"/>' +
         '<p style="margin:0 0 12px;font-size:11px;color:' +

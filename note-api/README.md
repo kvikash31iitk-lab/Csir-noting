@@ -1,79 +1,75 @@
-# note-api — use your Claude subscription (no API key)
+# note-api - ChatGPT/OpenAI backend
 
-A tiny Node service that the CSIR Note Sheet web app calls instead of
-`api.anthropic.com`. It runs the **`claude` CLI** (Claude Code) in headless
-mode, so generation uses the **Claude Max subscription** already logged in on
-your VPS — **no `ANTHROPIC_API_KEY`, no per-call cost.**
+This Node service is the backend for the CSIR Note Sheet web app. It stores the
+shared "brain" data and sends generation/OCR requests to the OpenAI Responses
+API using `OPENAI_API_KEY`.
 
 ```
 Browser (notesheet.cheetsheet.tech)
-        │  POST /generate { system, user }
-        ▼
-note-api (this service, on your VPS)
-        │  claude -p --output-format json ...
-        ▼
-Claude (billed to your Max subscription)
+        |  POST /generate { system, user }
+        v
+note-api (this service)
+        |  OpenAI Responses API
+        v
+ChatGPT/OpenAI model
 ```
 
-## Prerequisites (on the VPS — the same one running Cheatsheet)
-- Node.js 18+ (`node -v`)
-- The `claude` CLI installed **and logged in** for the user that will run this
-  service. Verify it works and uses the subscription:
-  ```bash
-  unset ANTHROPIC_API_KEY
-  echo "say hello in 3 words" | claude -p --output-format json | head
-  ```
-  If that prints a JSON result, you're good. (If you run it as a non-login
-  service user, log in once as that user: `sudo -u botuser -i claude` then
-  `/login`, OR set `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`.)
+## Prerequisites
 
-## Install & run
+- Node.js 18+ (`node -v`)
+- An OpenAI API key in `OPENAI_API_KEY`
+
+## Install & Run
+
 ```bash
-# from the repo on your VPS
 cd note-api
 npm install
 cp .env.example .env
-# edit .env: set ALLOWED_ORIGIN=https://notesheet.cheetsheet.tech
+# edit .env and set OPENAI_API_KEY=sk-...
 
-# test it
 node server.js
-# in another shell:
-curl -s localhost:8787/health
-curl -s -X POST localhost:8787/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"system":"Return only raw JSON.","user":"Return {\"ok\":true} as JSON."}'
 ```
 
+In another shell:
+
+```bash
+curl -s localhost:8787/health
+```
+
+`/generate` requires login/auth, so use the app login flow rather than testing
+it unauthenticated with curl.
+
 Keep it running with pm2:
+
 ```bash
 npm i -g pm2
 pm2 start server.js --name note-api
 pm2 save
 ```
 
-## Expose it on a subdomain (HTTPS)
-1. **DNS:** add an **A record** for `noteapi.cheetsheet.tech` → your VPS IP.
-2. **nginx:** copy `nginx.example.conf` to
-   `/etc/nginx/sites-available/noteapi.cheetsheet.tech`, symlink into
-   `sites-enabled/`, then `sudo nginx -t && sudo systemctl reload nginx`.
-3. **HTTPS:** `sudo certbot --nginx -d noteapi.cheetsheet.tech`
+## Key Settings
 
-Now `https://noteapi.cheetsheet.tech/generate` is your endpoint.
+- `OPENAI_API_KEY` - required.
+- `OPENAI_MODEL` - default `gpt-5.5`.
+- `OPENAI_VISION_MODEL` - default is the same as `OPENAI_MODEL`.
+- `OPENAI_BASE_URL` - optional OpenAI-compatible endpoint override.
+- `OPENAI_MAX_OUTPUT_TOKENS` and `OPENAI_OCR_MAX_OUTPUT_TOKENS` - output caps.
+- `OPENAI_REASONING_EFFORT` - optional, for models that support reasoning effort.
 
-## Point the app at it
-Open **https://notesheet.cheetsheet.tech**, click the **⚙ button**, and set
-**Backend URL** to:
-```
+## Expose It On A Subdomain
+
+1. Add a DNS A record for `noteapi.cheetsheet.tech` pointing to the VPS IP.
+2. Copy `nginx.example.conf` to
+   `/etc/nginx/sites-available/noteapi.cheetsheet.tech`, symlink it into
+   `sites-enabled/`, then run `sudo nginx -t && sudo systemctl reload nginx`.
+3. Enable HTTPS with `sudo certbot --nginx -d noteapi.cheetsheet.tech`.
+
+## Point The App At It
+
+Open `https://notesheet.cheetsheet.tech`, tap the settings button, and set:
+
+```text
 https://noteapi.cheetsheet.tech/generate
 ```
-Save. The app now generates notes through your subscription. (Leaving Backend
-URL blank falls back to an API key if set, otherwise demo mode.)
 
-## Notes
-- The service strips `ANTHROPIC_API_KEY` from the environment so it always uses
-  the subscription.
-- The Max subscription is your personal quota — great for internal office use,
-  not a high-traffic public service.
-- If generations look like coding-assistant chatter, set
-  `SYSTEM_PROMPT_FLAG=--system-prompt` in `.env` to fully replace the default
-  system prompt, and restart (`pm2 restart note-api`).
+After signing in, notes and OCR will run through ChatGPT/OpenAI.

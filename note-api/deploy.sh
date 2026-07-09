@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# One-shot deploy for note-api on a VPS that already has the `claude` CLI
-# logged in (e.g. your Cheatsheet VPS). Run it from inside the note-api/ folder:
+# One-shot deploy for note-api on a VPS using the OpenAI API. Run it from
+# inside the note-api/ folder:
 #
 #   cd note-api
 #   chmod +x deploy.sh
 #   ./deploy.sh
 #
 # Override any setting inline, e.g.:
-#   API_DOMAIN=noteapi.cheetsheet.tech SITE_ORIGIN=https://notesheet.cheetsheet.tech ./deploy.sh
+#   OPENAI_API_KEY=sk-... API_DOMAIN=noteapi.cheetsheet.tech SITE_ORIGIN=https://notesheet.cheetsheet.tech ./deploy.sh
 #
 set -euo pipefail
 
@@ -28,11 +28,15 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
 say "Checking prerequisites"
 command -v node >/dev/null || { echo "Node.js is required (node -v). Install it first."; exit 1; }
 command -v npm  >/dev/null || { echo "npm is required."; exit 1; }
-if ! command -v claude >/dev/null; then
-  warn "The 'claude' CLI was not found on PATH. Generation will fail until it is installed and logged in."
+EXISTING_OPENAI_API_KEY=""
+if [ -f .env ]; then
+  EXISTING_OPENAI_API_KEY="$(grep -E '^OPENAI_API_KEY=' .env | head -1 | cut -d= -f2- || true)"
 fi
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  warn "ANTHROPIC_API_KEY is set in this shell. The service ignores it, but to be safe: unset ANTHROPIC_API_KEY"
+OPENAI_API_KEY="${OPENAI_API_KEY:-$EXISTING_OPENAI_API_KEY}"
+OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.5}"
+OPENAI_VISION_MODEL="${OPENAI_VISION_MODEL:-$OPENAI_MODEL}"
+if [ -z "$OPENAI_API_KEY" ]; then
+  warn "OPENAI_API_KEY is not set. Add it to .env or re-run with OPENAI_API_KEY=sk-..."
 fi
 
 # ----------------------------- app -----------------------------
@@ -43,20 +47,13 @@ say "Writing .env"
 cat > .env <<ENV
 PORT=$PORT
 ALLOWED_ORIGIN=$SITE_ORIGIN
-CLAUDE_BIN=claude
-SYSTEM_PROMPT_FLAG=--append-system-prompt
+OPENAI_API_KEY=$OPENAI_API_KEY
+OPENAI_MODEL=$OPENAI_MODEL
+OPENAI_VISION_MODEL=$OPENAI_VISION_MODEL
 TIMEOUT_MS=120000
+OCR_TIMEOUT_MS=180000
 ENV
-echo "  PORT=$PORT  ALLOWED_ORIGIN=$SITE_ORIGIN"
-
-say "Quick self-test of the claude CLI (subscription)"
-if command -v claude >/dev/null; then
-  if (unset ANTHROPIC_API_KEY; echo "reply with the single word OK" | claude -p --output-format json >/tmp/claude_test.json 2>/tmp/claude_test.err); then
-    echo "  claude responded OK (subscription auth working)."
-  else
-    warn "claude test did not succeed. Log in as this user once: 'claude' then /login (or set CLAUDE_CODE_OAUTH_TOKEN). See: $(cat /tmp/claude_test.err 2>/dev/null | head -1)"
-  fi
-fi
+echo "  PORT=$PORT  ALLOWED_ORIGIN=$SITE_ORIGIN  OPENAI_MODEL=$OPENAI_MODEL"
 
 say "Starting the service with pm2"
 command -v pm2 >/dev/null || $SUDO npm install -g pm2
@@ -117,4 +114,4 @@ echo "  https://$API_DOMAIN/generate"
 echo
 echo "Final step — open $SITE_ORIGIN, tap the gear (settings), set:"
 echo "  Backend URL = https://$API_DOMAIN/generate"
-echo "  then Save. Notes will generate via your Claude subscription."
+echo "  then Save. Notes will generate via ChatGPT/OpenAI."

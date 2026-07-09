@@ -5,7 +5,7 @@ generate formal **"noting"** documents (internal office note sheets). It:
 
 1. **Learns** style and format from uploaded reference noting documents
 2. **Extracts** facts from a user-uploaded source document
-3. **Generates** a formatted note sheet via Claude
+3. **Generates** a formatted note sheet via ChatGPT/OpenAI
 4. Allows **chat-based iteration** and refinement
 5. **Exports** the final note as a downloadable DOCX file
 
@@ -25,9 +25,9 @@ generate formal **"noting"** documents (internal office note sheets). It:
   personal keys for the working session). It **never** uses `localStorage` /
   `sessionStorage` — the `index.html` harness provides a `window.storage` shim
   for local testing only.
-- **AI:** posts to `https://api.anthropic.com/v1/messages` with model
-  `claude-sonnet-4-20250514`. No API key is referenced anywhere in the code —
-  the host environment supplies authentication.
+- **AI:** calls the configured `note-api` backend (`/generate`), which uses
+  the OpenAI Responses API with `OPENAI_API_KEY`. The Android/web wrapper keeps
+  a legacy browser interception hook only for demo/offline compatibility.
 - **Documents:** reads `.docx` via mammoth.js and `.pdf`/text via the
   `FileReader` API; writes `.docx` via docx.js (falling back to `.txt` if DOCX
   generation fails).
@@ -48,10 +48,9 @@ python3 -m http.server 8000
 # then open http://localhost:8000/
 ```
 
-Direct Claude API calls from the browser require a host that proxies
-authentication (such as the Claude artifact environment); document reading,
-DOCX export, library learning UI, versioning, and diff view all work in the
-local harness regardless.
+Real AI generation requires the `note-api` backend to be running with
+`OPENAI_API_KEY` configured. Document reading, DOCX export, library learning UI,
+versioning, and diff view work in the local harness regardless.
 
 ## Using the app
 

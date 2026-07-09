@@ -1,14 +1,14 @@
 /*
  * CSIR Note Sheet — backend "brain" for the note-sheet app
  * --------------------------------------------------------
- * Runs the `claude` CLI (logged in with a Claude Max subscription, so NO
- * ANTHROPIC_API_KEY is needed) and keeps a small, file-based memory so the app
+ * Calls the OpenAI Responses API (ChatGPT models) and keeps a small,
+ * file-based memory so the app
  * becomes a growing institutional assistant.
  *
  * Endpoints
  *   GET  /health                      liveness
  *   POST /generate {system,user}      stateless text/JSON generation (unchanged)
- *   POST /extract  {dataUrl|base64}   OCR a scan/image/PDF via Claude vision
+ *   POST /extract  {dataUrl|base64}   OCR a scan/image/PDF via OpenAI vision
  *   POST /login    {password}         -> { token }  (Bearer for the routes below)
  *   GET  /brain                       full memory (learning, references, rules, notes)
  *   POST /brain/learning {text}       add a standing instruction
@@ -22,30 +22,46 @@
  *   GET  /backup                      download the whole brain as JSON
  *
  * Config (environment variables):
- *   PORT, ALLOWED_ORIGIN, CLAUDE_BIN, CLAUDE_MODEL, SYSTEM_PROMPT_FLAG,
- *   CLAUDE_MAX_TURNS, CLAUDE_DISABLE_TOOLS, CLAUDE_EXTRA_ARGS, TIMEOUT_MS,
+ *   PORT, ALLOWED_ORIGIN, OPENAI_API_KEY, OPENAI_MODEL, OPENAI_VISION_MODEL,
+ *   OPENAI_BASE_URL, OPENAI_MAX_OUTPUT_TOKENS, OCR_TIMEOUT_MS,
  *   APP_PASSWORD   password gating the /brain + /extract routes (unset = open)
  *   APP_SECRET     HMAC secret for tokens (defaults derived from APP_PASSWORD)
  *   DATA_DIR       where brain.json lives (default ./data)
- *   OCR_TOOLS      tools the OCR call may use (default "Read")
- *   OCR_MAX_TURNS  (default 6)   OCR_TIMEOUT_MS (default 180000)
  */
 const express = require("express");
-const { spawn } = require("child_process");
 const crypto = require("crypto");
 const https = require("https");
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
 
+function loadDotEnv(file) {
+  try {
+    const raw = fs.readFileSync(file, "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
+      if (!m || process.env[m[1]] !== undefined) continue;
+      let value = m[2].trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) value = value.slice(1, -1);
+      process.env[m[1]] = value;
+    }
+  } catch (_) {}
+}
+loadDotEnv(path.join(__dirname, ".env"));
+
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
-const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "";
-const SYSTEM_PROMPT_FLAG = process.env.SYSTEM_PROMPT_FLAG || "--system-prompt";
-const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || "1";
-const DISABLE_TOOLS = process.env.CLAUDE_DISABLE_TOOLS !== "0";
-const EXTRA_ARGS = (process.env.CLAUDE_EXTRA_ARGS || "").split(" ").filter(Boolean);
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.5";
+const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || OPENAI_MODEL;
+const OPENAI_MAX_OUTPUT_TOKENS = parseInt(process.env.OPENAI_MAX_OUTPUT_TOKENS || "4000", 10);
+const OPENAI_OCR_MAX_OUTPUT_TOKENS = parseInt(process.env.OPENAI_OCR_MAX_OUTPUT_TOKENS || "6000", 10);
+const OPENAI_REASONING_EFFORT = process.env.OPENAI_REASONING_EFFORT || "";
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "120000", 10);
 
 // --- accounts ---
@@ -95,10 +111,9 @@ if (!process.env.APP_SECRET) {
   );
 }
 
-// Neutral, empty working dir so /generate has no project/code to "look at".
-const NEUTRAL_CWD =
-  process.env.CLAUDE_CWD || path.join(os.tmpdir(), "csir-note-api-cwd");
-try { fs.mkdirSync(NEUTRAL_CWD, { recursive: true }); } catch (_) {}
+if (!OPENAI_API_KEY) {
+  console.warn("[AI] OPENAI_API_KEY is unset. /generate and /extract will fail until it is configured.");
+}
 
 /* ------------------------------------------------------------------ *
  *  File-based memory ("the brain")
@@ -240,45 +255,66 @@ async function verifyGoogleCredential(credential) {
 }
 
 /* ------------------------------------------------------------------ *
- *  Claude CLI runner (used by /generate and /extract)
+ *  OpenAI Responses client (used by /generate and /extract)
  * ------------------------------------------------------------------ */
-function runClaude({ args, stdin, cwd, timeoutMs }) {
-  return new Promise((resolve, reject) => {
-    const fullArgs = args.slice();
-    if (CLAUDE_MODEL && fullArgs.indexOf("--model") === -1) fullArgs.push("--model", CLAUDE_MODEL);
-    fullArgs.push(...EXTRA_ARGS);
-    const env = Object.assign({}, process.env);
-    delete env.ANTHROPIC_API_KEY; // force subscription auth
+function outputTextFromResponse(data) {
+  if (data && typeof data.output_text === "string") return data.output_text;
+  const chunks = [];
+  for (const item of (data && data.output) || []) {
+    for (const part of item.content || []) {
+      if (typeof part.text === "string") chunks.push(part.text);
+      else if (typeof part.output_text === "string") chunks.push(part.output_text);
+    }
+  }
+  return chunks.join("\n").trim();
+}
 
-    let child;
-    try { child = spawn(CLAUDE_BIN, fullArgs, { env, cwd: cwd || NEUTRAL_CWD }); }
-    catch (e) { return reject(new Error("could not start claude: " + e.message)); }
+async function callOpenAIResponses({ instructions, input, model, maxOutputTokens, timeoutMs }) {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set");
+  if (typeof fetch !== "function") throw new Error("Node.js 18+ fetch is required");
 
-    let out = "", err = "", finished = false;
-    const fin = (fn) => { if (!finished) { finished = true; fn(); } };
-    const timer = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch (_) {}
-      fin(() => reject(new Error("claude timed out")));
-    }, timeoutMs || TIMEOUT_MS);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs || TIMEOUT_MS);
+  const payload = {
+    model: model || OPENAI_MODEL,
+    input,
+    store: false,
+    max_output_tokens: maxOutputTokens || OPENAI_MAX_OUTPUT_TOKENS,
+  };
+  if (instructions) payload.instructions = instructions;
+  if (OPENAI_REASONING_EFFORT) payload.reasoning = { effort: OPENAI_REASONING_EFFORT };
 
-    child.stdout.on("data", (d) => { out += d; });
-    child.stderr.on("data", (d) => { err += d; });
-    child.on("error", (e) => { clearTimeout(timer); fin(() => reject(new Error("claude spawn error: " + e.message))); });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0 && !out)
-        return fin(() => reject(new Error("claude exited " + code + ": " + err.slice(0, 400))));
-      let text = out;
-      try {
-        const j = JSON.parse(out);
-        text = j.result || j.text || (j.content && j.content[0] && j.content[0].text) || out;
-      } catch (_) {}
-      fin(() => resolve(text));
+  try {
+    const response = await fetch(OPENAI_BASE_URL + "/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + OPENAI_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
     });
+    const raw = await response.text();
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
 
-    try { if (stdin != null) child.stdin.write(stdin); child.stdin.end(); }
-    catch (e) { clearTimeout(timer); fin(() => reject(new Error("failed writing prompt: " + e.message))); }
-  });
+    if (!response.ok) {
+      const detail =
+        (data && data.error && (data.error.message || data.error.code)) ||
+        raw.slice(0, 400) ||
+        "OpenAI request failed";
+      throw new Error("openai HTTP " + response.status + ": " + detail);
+    }
+
+    const text = outputTextFromResponse(data);
+    if (!text) throw new Error("openai returned no text");
+    return text;
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("openai timed out");
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -324,7 +360,15 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_req, res) =>
-  res.json({ ok: true, users: USERS.length, google: !!GOOGLE_CLIENT_ID }));
+  res.json({
+    ok: true,
+    users: USERS.length,
+    google: !!GOOGLE_CLIENT_ID,
+    ai: "openai",
+    model: OPENAI_MODEL,
+    visionModel: OPENAI_VISION_MODEL,
+    openaiConfigured: !!OPENAI_API_KEY,
+  }));
 
 // --- generation (now authenticated + rate-limited; was previously open) ---
 app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, async (req, res) => {
@@ -333,34 +377,36 @@ app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, asyn
   const user = typeof body.user === "string" ? body.user : "";
   if (!user) return res.status(400).json({ error: "missing 'user' prompt" });
 
-  // Keep a SMALL fixed system prompt on the CLI (to replace Claude's coding-agent
-  // default) and move the caller's possibly-huge system prompt into STDIN, so a
-  // large rule/context payload can never overflow the OS arg limit (E2BIG).
+  // Keep a fixed top-level instruction and append the app's larger prompt as
+  // request-body instructions, so large rule/context payloads stay safe.
   const BASE_SYSTEM =
     "You are a precise writing assistant for Indian government office notings. " +
     "Follow the instructions in the user message exactly and output ONLY what is " +
     "requested (raw JSON when asked) — no preamble, no markdown, no code fences.";
-  const args = ["-p", "--output-format", "json", SYSTEM_PROMPT_FLAG, BASE_SYSTEM];
-  args.push("--max-turns", String(MAX_TURNS));
-  if (DISABLE_TOOLS) args.push("--tools", "");
-  const combined = system ? system + "\n\n=====\n\n" + user : user;
-
   try {
-    const text = await runClaude({ args, stdin: combined, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS });
+    const text = await callOpenAIResponses({
+      instructions: BASE_SYSTEM + (system ? "\n\n" + system : ""),
+      input: user,
+      model: OPENAI_MODEL,
+      maxOutputTokens: OPENAI_MAX_OUTPUT_TOKENS,
+      timeoutMs: TIMEOUT_MS,
+    });
     res.json({ content: [{ type: "text", text }] });
   } catch (e) {
     console.error("[generate] error:", (e && e.stack) || e);
     const msg = String((e && e.message) || e);
     // Surface quota/limit distinctly so the UI can tell the operator; never leak stderr.
-    if (/limit|quota|usage|429|rate/i.test(msg))
-      return res.status(429).json({ error: "AI usage limit reached — try again later", code: "quota" });
-    if (/timed out/i.test(msg))
-      return res.status(504).json({ error: "AI timed out — try a shorter note", code: "timeout" });
+    if (/OPENAI_API_KEY/i.test(msg))
+      return res.status(500).json({ error: "OpenAI API key is not configured", code: "config" });
+    if (/limit|quota|usage|429|rate|insufficient_quota/i.test(msg))
+      return res.status(429).json({ error: "AI usage limit reached - try again later", code: "quota" });
+    if (/timed out|timeout/i.test(msg))
+      return res.status(504).json({ error: "AI timed out - try a shorter note", code: "timeout" });
     res.status(500).json({ error: "generation failed", code: "error" });
   }
 });
 
-// --- OCR via Claude vision (Read tool on a temp file) ---
+// --- OCR via OpenAI vision/file inputs ---
 app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async (req, res) => {
   const b = req.body || {};
   let raw = b.dataUrl || b.imageBase64 || b.base64 || "";
@@ -377,32 +423,41 @@ app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async
   if (ext === "jpeg") ext = "jpg";
   if (!ext) ext = "png";
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ocr-"));
-  const fname = "page." + ext;
-  const fpath = path.join(dir, fname);
   try {
-    fs.writeFileSync(fpath, Buffer.from(raw, "base64"));
+    if (!mime) mime = ext === "pdf" ? "application/pdf" : "image/" + ext;
+    const dataUrl = "data:" + mime + ";base64," + raw;
+    const filename = String(b.filename || ("upload." + ext)).replace(/[^\w.\- ()]/g, "_");
     const prompt =
-      "Read the file ./" + fname + " in the current directory and transcribe ALL of " +
-      "its text verbatim, preserving line breaks and layout where reasonable. It may " +
+      "Transcribe ALL text from the attached " + (ext === "pdf" ? "PDF" : "image") +
+      " verbatim, preserving line breaks and layout where reasonable. It may " +
       "contain a mix of English and Hindi (Devanagari) — transcribe both faithfully. " +
       "Do not summarise, translate, or add commentary. Output ONLY the transcribed text.";
-    const text = await runClaude({
-      args: [
-        "-p", "--output-format", "json",
-        "--max-turns", process.env.OCR_MAX_TURNS || "6",
-        "--tools", process.env.OCR_TOOLS || "Read",
-      ],
-      stdin: prompt,
-      cwd: dir,
+    const filePart = ext === "pdf"
+      ? { type: "input_file", filename, file_data: dataUrl, detail: "high" }
+      : { type: "input_image", image_url: dataUrl };
+    const text = await callOpenAIResponses({
+      input: [{
+        role: "user",
+        content: [
+          filePart,
+          { type: "input_text", text: prompt },
+        ],
+      }],
+      model: OPENAI_VISION_MODEL,
+      maxOutputTokens: OPENAI_OCR_MAX_OUTPUT_TOKENS,
       timeoutMs: parseInt(process.env.OCR_TIMEOUT_MS || "180000", 10),
     });
     res.json({ text: String(text || "").trim() });
   } catch (e) {
     console.error("[extract] error:", (e && e.stack) || e);
-    res.status(500).json({ error: "ocr failed" });
-  } finally {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+    const msg = String((e && e.message) || e);
+    if (/OPENAI_API_KEY/i.test(msg))
+      return res.status(500).json({ error: "OpenAI API key is not configured", code: "config" });
+    if (/limit|quota|usage|429|rate|insufficient_quota/i.test(msg))
+      return res.status(429).json({ error: "AI usage limit reached - try again later", code: "quota" });
+    if (/timed out|timeout/i.test(msg))
+      return res.status(504).json({ error: "OCR timed out - try a smaller file", code: "timeout" });
+    res.status(500).json({ error: "ocr failed", code: "error" });
   }
 });
 
