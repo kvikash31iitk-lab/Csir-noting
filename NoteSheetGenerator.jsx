@@ -61,6 +61,21 @@ const FONT_CHOICES = [
   "Mangal", // Devanagari
   "Nirmala UI", // English + Hindi
 ];
+// The preview (unlike DOCX export, which needs one literal font name) can use
+// a CSS fallback chain. Most Devanagari-oriented fonts chosen here (Times New
+// Roman etc.) have zero Hindi glyphs, and per-glyph browser fallback can fail
+// to shape complex conjuncts correctly (they render as tofu boxes) unless a
+// capable font is explicitly listed. Keep the user's chosen font first (for
+// Latin text) and add Devanagari-capable fonts as fallback.
+function previewFontStack(primary) {
+  const fallbacks = ["Nirmala UI", "Mangal", "Noto Sans Devanagari"].filter(
+    (f) => f.toLowerCase() !== String(primary || "").toLowerCase()
+  );
+  return [primary, ...fallbacks, "sans-serif"]
+    .filter(Boolean)
+    .map((f) => `"${f}"`)
+    .join(", ");
+}
 const FONT_SIZE_CHOICES = [10, 11, 12, 13, 14, 16];
 const LINE_SPACING_CHOICES = [1, 1.15, 1.5, 2];
 
@@ -3294,7 +3309,7 @@ function NotePreview({ note, prev, showDiff, editing, edit, docStyle }) {
   return (
     <div
       className="mx-auto max-w-prose text-gray-900"
-      style={{ fontFamily: ds.fontFamily }}
+      style={{ fontFamily: previewFontStack(ds.fontFamily) }}
     >
       {E ? (
         <input
