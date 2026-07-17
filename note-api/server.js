@@ -1,14 +1,14 @@
 /*
  * CSIR Note Sheet — backend "brain" for the note-sheet app
  * --------------------------------------------------------
- * Runs the `claude` CLI (logged in with a Claude Max subscription, so NO
- * ANTHROPIC_API_KEY is needed) and keeps a small, file-based memory so the app
- * becomes a growing institutional assistant.
+ * Runs the `gemini` CLI (logged in via "Login with Google" against a Gemini
+ * subscription, so NO GEMINI_API_KEY is needed) and keeps a small, file-based
+ * memory so the app becomes a growing institutional assistant.
  *
  * Endpoints
  *   GET  /health                      liveness
  *   POST /generate {system,user}      stateless text/JSON generation (unchanged)
- *   POST /extract  {dataUrl|base64}   OCR a scan/image/PDF via Claude vision
+ *   POST /extract  {dataUrl|base64}   OCR a scan/image/PDF via Gemini vision
  *   POST /login    {password}         -> { token }  (Bearer for the routes below)
  *   GET  /brain                       full memory (learning, references, rules, notes)
  *   POST /brain/learning {text}       add a standing instruction
@@ -22,13 +22,12 @@
  *   GET  /backup                      download the whole brain as JSON
  *
  * Config (environment variables):
- *   PORT, ALLOWED_ORIGIN, CLAUDE_BIN, CLAUDE_MODEL, SYSTEM_PROMPT_FLAG,
- *   CLAUDE_MAX_TURNS, CLAUDE_DISABLE_TOOLS, CLAUDE_EXTRA_ARGS, TIMEOUT_MS,
+ *   PORT, ALLOWED_ORIGIN, GEMINI_BIN, GEMINI_MODEL, GEMINI_EXTRA_ARGS,
+ *   TIMEOUT_MS,
  *   APP_PASSWORD   password gating the /brain + /extract routes (unset = open)
  *   APP_SECRET     HMAC secret for tokens (defaults derived from APP_PASSWORD)
  *   DATA_DIR       where brain.json lives (default ./data)
- *   OCR_TOOLS      tools the OCR call may use (default "Read")
- *   OCR_MAX_TURNS  (default 6)   OCR_TIMEOUT_MS (default 180000)
+ *   OCR_TIMEOUT_MS (default 180000)
  */
 const express = require("express");
 const { spawn } = require("child_process");
@@ -40,12 +39,9 @@ const path = require("path");
 
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
-const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "";
-const SYSTEM_PROMPT_FLAG = process.env.SYSTEM_PROMPT_FLAG || "--system-prompt";
-const MAX_TURNS = process.env.CLAUDE_MAX_TURNS || "1";
-const DISABLE_TOOLS = process.env.CLAUDE_DISABLE_TOOLS !== "0";
-const EXTRA_ARGS = (process.env.CLAUDE_EXTRA_ARGS || "").split(" ").filter(Boolean);
+const GEMINI_BIN = process.env.GEMINI_BIN || "gemini";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "";
+const EXTRA_ARGS = (process.env.GEMINI_EXTRA_ARGS || "").split(" ").filter(Boolean);
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "120000", 10);
 
 // --- accounts ---
@@ -97,8 +93,19 @@ if (!process.env.APP_SECRET) {
 
 // Neutral, empty working dir so /generate has no project/code to "look at".
 const NEUTRAL_CWD =
-  process.env.CLAUDE_CWD || path.join(os.tmpdir(), "csir-note-api-cwd");
+  process.env.GEMINI_CWD || path.join(os.tmpdir(), "csir-note-api-cwd");
 try { fs.mkdirSync(NEUTRAL_CWD, { recursive: true }); } catch (_) {}
+
+// Small, fixed system prompt (replaces Gemini CLI's coding-agent default via
+// GEMINI_SYSTEM_MD). The caller's possibly-huge system prompt still goes over
+// STDIN with the user message on every /generate call — this file never changes,
+// so it never needs to be rewritten per-request.
+const BASE_SYSTEM =
+  "You are a precise writing assistant for Indian government office notings. " +
+  "Follow the instructions in the user message exactly and output ONLY what is " +
+  "requested (raw JSON when asked) — no preamble, no markdown, no code fences.";
+const SYSTEM_MD_FILE = path.join(NEUTRAL_CWD, "system.md");
+try { fs.writeFileSync(SYSTEM_MD_FILE, BASE_SYSTEM); } catch (_) {}
 
 /* ------------------------------------------------------------------ *
  *  File-based memory ("the brain")
@@ -240,39 +247,47 @@ async function verifyGoogleCredential(credential) {
 }
 
 /* ------------------------------------------------------------------ *
- *  Claude CLI runner (used by /generate and /extract)
+ *  Gemini CLI runner (used by /generate and /extract)
+ *
+ *  Headless mode is triggered by piping the prompt over STDIN with no TTY
+ *  attached (spawn() gives it pipes, never a TTY) — this also keeps large
+ *  system/user content off the CLI argv, avoiding an OS arg-length (E2BIG)
+ *  failure the same way a large-argv payload would with any CLI.
  * ------------------------------------------------------------------ */
-function runClaude({ args, stdin, cwd, timeoutMs }) {
+function runGemini({ args, stdin, cwd, timeoutMs, systemMdFile }) {
   return new Promise((resolve, reject) => {
     const fullArgs = args.slice();
-    if (CLAUDE_MODEL && fullArgs.indexOf("--model") === -1) fullArgs.push("--model", CLAUDE_MODEL);
+    if (GEMINI_MODEL && fullArgs.indexOf("--model") === -1) fullArgs.push("--model", GEMINI_MODEL);
     fullArgs.push(...EXTRA_ARGS);
     const env = Object.assign({}, process.env);
-    delete env.ANTHROPIC_API_KEY; // force subscription auth
+    delete env.GEMINI_API_KEY; // force subscription (OAuth "Login with Google") auth
+    if (systemMdFile) env.GEMINI_SYSTEM_MD = systemMdFile;
 
     let child;
-    try { child = spawn(CLAUDE_BIN, fullArgs, { env, cwd: cwd || NEUTRAL_CWD }); }
-    catch (e) { return reject(new Error("could not start claude: " + e.message)); }
+    try { child = spawn(GEMINI_BIN, fullArgs, { env, cwd: cwd || NEUTRAL_CWD }); }
+    catch (e) { return reject(new Error("could not start gemini: " + e.message)); }
 
     let out = "", err = "", finished = false;
     const fin = (fn) => { if (!finished) { finished = true; fn(); } };
     const timer = setTimeout(() => {
       try { child.kill("SIGKILL"); } catch (_) {}
-      fin(() => reject(new Error("claude timed out")));
+      fin(() => reject(new Error("gemini timed out")));
     }, timeoutMs || TIMEOUT_MS);
 
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => { err += d; });
-    child.on("error", (e) => { clearTimeout(timer); fin(() => reject(new Error("claude spawn error: " + e.message))); });
+    child.on("error", (e) => { clearTimeout(timer); fin(() => reject(new Error("gemini spawn error: " + e.message))); });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code !== 0 && !out)
-        return fin(() => reject(new Error("claude exited " + code + ": " + err.slice(0, 400))));
-      let text = out;
+      let text = out, apiErr = null;
       try {
         const j = JSON.parse(out);
-        text = j.result || j.text || (j.content && j.content[0] && j.content[0].text) || out;
+        if (j.error) apiErr = j.error.message || JSON.stringify(j.error);
+        text = j.response != null ? j.response : (j.result || j.text || out);
       } catch (_) {}
+      if (apiErr) return fin(() => reject(new Error(apiErr)));
+      if (code !== 0 && !text)
+        return fin(() => reject(new Error("gemini exited " + code + ": " + err.slice(0, 400))));
       fin(() => resolve(text));
     });
 
@@ -333,20 +348,16 @@ app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, asyn
   const user = typeof body.user === "string" ? body.user : "";
   if (!user) return res.status(400).json({ error: "missing 'user' prompt" });
 
-  // Keep a SMALL fixed system prompt on the CLI (to replace Claude's coding-agent
-  // default) and move the caller's possibly-huge system prompt into STDIN, so a
+  // BASE_SYSTEM (fixed) is supplied via GEMINI_SYSTEM_MD; the caller's possibly-huge
+  // system prompt is combined with the user message and sent over STDIN only, so a
   // large rule/context payload can never overflow the OS arg limit (E2BIG).
-  const BASE_SYSTEM =
-    "You are a precise writing assistant for Indian government office notings. " +
-    "Follow the instructions in the user message exactly and output ONLY what is " +
-    "requested (raw JSON when asked) — no preamble, no markdown, no code fences.";
-  const args = ["-p", "--output-format", "json", SYSTEM_PROMPT_FLAG, BASE_SYSTEM];
-  args.push("--max-turns", String(MAX_TURNS));
-  if (DISABLE_TOOLS) args.push("--tools", "");
+  const args = ["--output-format", "json", "--approval-mode", "default"];
   const combined = system ? system + "\n\n=====\n\n" + user : user;
 
   try {
-    const text = await runClaude({ args, stdin: combined, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS });
+    const text = await runGemini({
+      args, stdin: combined, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS, systemMdFile: SYSTEM_MD_FILE,
+    });
     res.json({ content: [{ type: "text", text }] });
   } catch (e) {
     console.error("[generate] error:", (e && e.stack) || e);
@@ -360,7 +371,7 @@ app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, asyn
   }
 });
 
-// --- OCR via Claude vision (Read tool on a temp file) ---
+// --- OCR via Gemini vision (@-file reference to a temp file) ---
 app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async (req, res) => {
   const b = req.body || {};
   let raw = b.dataUrl || b.imageBase64 || b.base64 || "";
@@ -383,16 +394,12 @@ app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async
   try {
     fs.writeFileSync(fpath, Buffer.from(raw, "base64"));
     const prompt =
-      "Read the file ./" + fname + " in the current directory and transcribe ALL of " +
-      "its text verbatim, preserving line breaks and layout where reasonable. It may " +
-      "contain a mix of English and Hindi (Devanagari) — transcribe both faithfully. " +
-      "Do not summarise, translate, or add commentary. Output ONLY the transcribed text.";
-    const text = await runClaude({
-      args: [
-        "-p", "--output-format", "json",
-        "--max-turns", process.env.OCR_MAX_TURNS || "6",
-        "--tools", process.env.OCR_TOOLS || "Read",
-      ],
+      "Transcribe ALL of the text in @" + fname + " verbatim, preserving line breaks " +
+      "and layout where reasonable. It may contain a mix of English and Hindi " +
+      "(Devanagari) — transcribe both faithfully. Do not summarise, translate, or add " +
+      "commentary. Output ONLY the transcribed text.";
+    const text = await runGemini({
+      args: ["--output-format", "json", "--approval-mode", "default"],
       stdin: prompt,
       cwd: dir,
       timeoutMs: parseInt(process.env.OCR_TIMEOUT_MS || "180000", 10),
@@ -529,7 +536,8 @@ app.listen(PORT, () => {
   console.log(
     "csir-note-api listening on :" + PORT +
     " (origin: " + ALLOWED_ORIGIN + ", users: " + USERS.length +
-    ", google: " + (GOOGLE_CLIENT_ID ? "on" : "off") +
+    ", google login: " + (GOOGLE_CLIENT_ID ? "on" : "off") +
+    ", gemini bin: " + GEMINI_BIN +
     ", data: " + DATA_DIR + ")"
   );
 });

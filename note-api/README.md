@@ -1,31 +1,33 @@
-# note-api — use your Claude subscription (no API key)
+# note-api — use your Gemini subscription (no API key)
 
-A tiny Node service that the CSIR Note Sheet web app calls instead of
-`api.anthropic.com`. It runs the **`claude` CLI** (Claude Code) in headless
-mode, so generation uses the **Claude Max subscription** already logged in on
-your VPS — **no `ANTHROPIC_API_KEY`, no per-call cost.**
+A tiny Node service that the CSIR Note Sheet web app calls for AI generation.
+It runs the **`gemini` CLI** (Gemini CLI) in headless mode, so generation uses
+the **Gemini subscription** already logged in on your VPS — **no
+`GEMINI_API_KEY`, no per-call cost.**
 
 ```
 Browser (notesheet.cheetsheet.tech)
         │  POST /generate { system, user }
         ▼
 note-api (this service, on your VPS)
-        │  claude -p --output-format json ...
+        │  gemini --output-format json ...   (prompt piped over STDIN)
         ▼
-Claude (billed to your Max subscription)
+Gemini (billed to your subscription)
 ```
 
 ## Prerequisites (on the VPS — the same one running Cheatsheet)
 - Node.js 18+ (`node -v`)
-- The `claude` CLI installed **and logged in** for the user that will run this
-  service. Verify it works and uses the subscription:
+- The `gemini` CLI installed **and logged in** for the user that will run this
+  service (matches whatever user pm2 runs `note-api` as — check with
+  `pm2 info note-api`). Verify it works and uses the subscription:
   ```bash
-  unset ANTHROPIC_API_KEY
-  echo "say hello in 3 words" | claude -p --output-format json | head
+  unset GEMINI_API_KEY
+  echo "say hello in 3 words" | gemini --output-format json | head
   ```
-  If that prints a JSON result, you're good. (If you run it as a non-login
-  service user, log in once as that user: `sudo -u botuser -i claude` then
-  `/login`, OR set `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`.)
+  If that prints a JSON result with a `"response"` field, you're good. If not
+  logged in yet, run `gemini` interactively as that user, then `/login` and
+  choose **"Login with Google"** (this is the option that uses your Gemini
+  subscription rather than an API key).
 
 ## Install & run
 ```bash
@@ -66,14 +68,18 @@ Open **https://notesheet.cheetsheet.tech**, click the **⚙ button**, and set
 ```
 https://noteapi.cheetsheet.tech/generate
 ```
-Save. The app now generates notes through your subscription. (Leaving Backend
-URL blank falls back to an API key if set, otherwise demo mode.)
+Save, then sign in (top of Library) — `/generate` requires a signed-in
+session. The app now generates notes through your Gemini subscription.
+(Leaving Backend URL blank means the app has no way to generate — there is no
+built-in fallback.)
 
 ## Notes
-- The service strips `ANTHROPIC_API_KEY` from the environment so it always uses
-  the subscription.
-- The Max subscription is your personal quota — great for internal office use,
-  not a high-traffic public service.
-- If generations look like coding-assistant chatter, set
-  `SYSTEM_PROMPT_FLAG=--system-prompt` in `.env` to fully replace the default
-  system prompt, and restart (`pm2 restart note-api`).
+- The service strips `GEMINI_API_KEY` from the environment so it always uses
+  the subscription (OAuth "Login with Google"), never per-call API billing.
+- Your subscription quota is personal — great for internal office use, not a
+  high-traffic public service.
+- The fixed system prompt (identity + output-format rules) is written once to
+  `<NEUTRAL_CWD>/system.md` and passed via `GEMINI_SYSTEM_MD`; the caller's
+  (possibly large) rule/context payload is combined with the user message and
+  sent over STDIN on every request, never as a CLI argument — this avoids the
+  OS argument-length limit (E2BIG) that large rulebooks can hit.

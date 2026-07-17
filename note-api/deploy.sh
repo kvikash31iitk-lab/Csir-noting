@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# One-shot deploy for note-api on a VPS that already has the `claude` CLI
+# One-shot deploy for note-api on a VPS that already has the `gemini` CLI
 # logged in (e.g. your Cheatsheet VPS). Run it from inside the note-api/ folder:
 #
 #   cd note-api
@@ -28,11 +28,11 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
 say "Checking prerequisites"
 command -v node >/dev/null || { echo "Node.js is required (node -v). Install it first."; exit 1; }
 command -v npm  >/dev/null || { echo "npm is required."; exit 1; }
-if ! command -v claude >/dev/null; then
-  warn "The 'claude' CLI was not found on PATH. Generation will fail until it is installed and logged in."
+if ! command -v gemini >/dev/null; then
+  warn "The 'gemini' CLI was not found on PATH. Generation will fail until it is installed and logged in."
 fi
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  warn "ANTHROPIC_API_KEY is set in this shell. The service ignores it, but to be safe: unset ANTHROPIC_API_KEY"
+if [ -n "${GEMINI_API_KEY:-}" ]; then
+  warn "GEMINI_API_KEY is set in this shell. The service ignores it, but to be safe: unset GEMINI_API_KEY"
 fi
 
 # ----------------------------- app -----------------------------
@@ -43,18 +43,17 @@ say "Writing .env"
 cat > .env <<ENV
 PORT=$PORT
 ALLOWED_ORIGIN=$SITE_ORIGIN
-CLAUDE_BIN=claude
-SYSTEM_PROMPT_FLAG=--append-system-prompt
+GEMINI_BIN=gemini
 TIMEOUT_MS=120000
 ENV
 echo "  PORT=$PORT  ALLOWED_ORIGIN=$SITE_ORIGIN"
 
-say "Quick self-test of the claude CLI (subscription)"
-if command -v claude >/dev/null; then
-  if (unset ANTHROPIC_API_KEY; echo "reply with the single word OK" | claude -p --output-format json >/tmp/claude_test.json 2>/tmp/claude_test.err); then
-    echo "  claude responded OK (subscription auth working)."
+say "Quick self-test of the gemini CLI (subscription)"
+if command -v gemini >/dev/null; then
+  if (unset GEMINI_API_KEY; echo "reply with the single word OK" | gemini --output-format json >/tmp/gemini_test.json 2>/tmp/gemini_test.err); then
+    echo "  gemini responded OK (subscription auth working)."
   else
-    warn "claude test did not succeed. Log in as this user once: 'claude' then /login (or set CLAUDE_CODE_OAUTH_TOKEN). See: $(cat /tmp/claude_test.err 2>/dev/null | head -1)"
+    warn "gemini test did not succeed. Log in as this user once: 'gemini' then /login -> Login with Google. See: $(cat /tmp/gemini_test.err 2>/dev/null | head -1)"
   fi
 fi
 
@@ -117,4 +116,4 @@ echo "  https://$API_DOMAIN/generate"
 echo
 echo "Final step — open $SITE_ORIGIN, tap the gear (settings), set:"
 echo "  Backend URL = https://$API_DOMAIN/generate"
-echo "  then Save. Notes will generate via your Claude subscription."
+echo "  then Save. Notes will generate via your Gemini subscription."

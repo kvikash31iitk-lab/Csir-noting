@@ -8,22 +8,22 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
  *
  * - Learns style/format from uploaded reference notings
  * - Extracts facts from a source document
- * - Generates a formatted note sheet via Claude
+ * - Generates a formatted note sheet via Gemini
  * - Allows chat-based iterative refinement
  * - Exports the final note as a DOCX file
  *
  * Storage: window.storage (NOT localStorage / sessionStorage)
- * AI:      fetch -> https://api.anthropic.com/v1/messages
+ * AI:      note-api backend (/generate) -> `gemini` CLI, billed to a Gemini subscription
  * DOCX in: mammoth.js (CDN)   DOCX out: docx.js (CDN)
  */
 
 /* ------------------------------------------------------------------ *
  *  CONSTANTS
  * ------------------------------------------------------------------ */
-// Generation is NOT done directly against api.anthropic.com (that needs a
-// secret API key and is blocked by CORS from the browser). Instead we call the
-// note-api backend's /generate endpoint, which runs the `claude` CLI on the
-// server against the Max subscription. The model/token limits live there.
+// Generation is NOT done directly against a provider API (that needs a secret
+// API key and is blocked by CORS from the browser). Instead we call the
+// note-api backend's /generate endpoint, which runs the `gemini` CLI on the
+// server against the Gemini subscription. The model/token limits live there.
 
 const MAMMOTH_CDN =
   "https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js";
@@ -222,11 +222,11 @@ async function storageDelete(key, shared = false) {
   }
 }
 
-/** Generate text via the note-api backend (/generate runs the `claude` CLI on
- *  the server, billed to the Max subscription). apiFetch attaches the Bearer
- *  token, clears it on 401, and surfaces quota/timeout errors from the server.
- *  Throws on failure (callers must try/catch). */
-async function callClaude(systemPrompt, userMessage) {
+/** Generate text via the note-api backend (/generate runs the `gemini` CLI on
+ *  the server, billed to the Gemini subscription). apiFetch attaches the
+ *  Bearer token, clears it on 401, and surfaces quota/timeout errors from the
+ *  server. Throws on failure (callers must try/catch). */
+async function callGemini(systemPrompt, userMessage) {
   const data = await apiFetch("/generate", {
     method: "POST",
     body: JSON.stringify({ system: systemPrompt, user: userMessage }),
@@ -235,13 +235,13 @@ async function callClaude(systemPrompt, userMessage) {
   return block && block.text ? block.text : "";
 }
 
-/* Call Claude and parse JSON, retrying a couple of times on a transient error
+/* Call Gemini and parse JSON, retrying a couple of times on a transient error
  * or an unparseable response. Returns the parsed object, or null. */
-async function callClaudeJSON(systemPrompt, userMessage, attempts) {
+async function callGeminiJSON(systemPrompt, userMessage, attempts) {
   attempts = attempts || 3;
   for (let i = 0; i < attempts; i++) {
     try {
-      const resp = await callClaude(systemPrompt, userMessage);
+      const resp = await callGemini(systemPrompt, userMessage);
       const parsed = parseJSON(resp);
       if (parsed) return parsed;
     } catch (e) {
@@ -253,7 +253,7 @@ async function callClaudeJSON(systemPrompt, userMessage, attempts) {
 }
 
 /* ------------------------------------------------------------------ *
- *  Brain API client — server-side memory, rule library, Claude OCR.
+ *  Brain API client — server-side memory, rule library, Gemini OCR.
  *  The base URL is derived from the configured backend (…/generate ->
  *  its root); the login token is kept in localStorage.
  * ------------------------------------------------------------------ */
@@ -347,11 +347,11 @@ function fileToDataUrl(file) {
     r.readAsDataURL(file);
   });
 }
-/* Claude-vision OCR via the backend (primary engine). Returns "" if no backend
+/* Gemini-vision OCR via the backend (primary engine). Returns "" if no backend
  * is configured or the call is rejected, so the caller can fall back locally. */
 async function ocrViaBackend(file, onStatus) {
   if (!apiBase()) return "";
-  if (typeof onStatus === "function") onStatus("Reading with Claude vision…");
+  if (typeof onStatus === "function") onStatus("Reading with Gemini vision…");
   const dataUrl = await fileToDataUrl(file);
   const out = await api.extract({
     dataUrl,
@@ -444,7 +444,7 @@ async function readSpreadsheet(file) {
 
 /* Local OCR via tesseract.js. Handles image files directly and scanned PDFs by
  * rendering each page to a canvas first (PDF.js). Used as the fallback OCR
- * engine; Claude vision is the primary path (added separately). */
+ * engine; Gemini vision is the primary path (added separately). */
 async function ocrWithTesseract(file, onStatus) {
   await loadScript(TESSERACT_CDN);
   if (!window.Tesseract) throw new Error("ocr unavailable");
@@ -485,12 +485,12 @@ async function ocrWithTesseract(file, onStatus) {
   return ((res && res.data && res.data.text) || "").trim();
 }
 
-/* OCR dispatcher. Claude vision (the better engine for Hindi / messy govt
+/* OCR dispatcher. Gemini vision (the better engine for Hindi / messy govt
  * scans) is the primary path; tesseract.js is the local fallback. */
 async function ocrFile(file, onStatus) {
   try {
-    const viaClaude = await ocrViaBackend(file, onStatus);
-    if (viaClaude && viaClaude.replace(/\s/g, "").length >= 5) return viaClaude;
+    const viaGemini = await ocrViaBackend(file, onStatus);
+    if (viaGemini && viaGemini.replace(/\s/g, "").length >= 5) return viaGemini;
   } catch (_) {
     /* fall back to local OCR */
   }
@@ -994,7 +994,7 @@ export default function App() {
       try {
         const sys =
           "You convert a one-off editing instruction for a CSIR government office note into a SHORT, general standing rule the writer wants followed in ALL future notes. Keep the user's intent, make it reusable. Return ONLY the rule text as one sentence — no preamble, no quotes.";
-        const resp = await callClaude(sys, basis);
+        const resp = await callGemini(sys, basis);
         if (resp && resp.trim()) lesson = resp.trim().replace(/^["']|["']$/g, "");
       } catch (e) {
         /* keep the raw instruction as the lesson */
@@ -1160,7 +1160,7 @@ export default function App() {
     try {
       const sys =
         "You are distilling permanent, reusable learning points from an older government office noting document so future notes match this office's style and rules. Return only raw JSON with no markdown, no backticks, no preamble: { learnings: array of 3 to 7 short instruction strings capturing tone, structure, phrasing, and any rules to always follow }";
-      const resp = await callClaude(sys, rawText);
+      const resp = await callGemini(sys, rawText);
       const parsed = parseJSON(resp);
       learnings =
         parsed && Array.isArray(parsed.learnings) ? parsed.learnings : null;
@@ -1280,7 +1280,7 @@ export default function App() {
         "  tags: array containing relevant tags from Finance, Admin, Audit, Legal, HR,\n" +
         "  language: one of English or Hindi or Mixed\n" +
         "}";
-      const resp = await callClaude(sys, rawText);
+      const resp = await callGemini(sys, rawText);
       analysis = parseJSON(resp);
     } catch (e) {
       setRefLoading(false);
@@ -1496,7 +1496,7 @@ export default function App() {
         "}\n" +
         "Document text: " +
         combined;
-      const parsed = await callClaudeJSON(sys, userMsg, 3);
+      const parsed = await callGeminiJSON(sys, userMsg, 3);
       if (!parsed) {
         showToast("AI call failed — please retry", "error");
         setSourceProcessing(false);
@@ -1703,7 +1703,7 @@ export default function App() {
           ". Use signature chain: " +
           JSON.stringify(chain) +
           ".";
-      const note = normalizeNote(await callClaudeJSON(sys, userMsg, 3));
+      const note = normalizeNote(await callGeminiJSON(sys, userMsg, 3));
       if (!note) {
         showToast("AI call failed — please retry", "error");
         setGenerating(false);
@@ -1793,7 +1793,7 @@ export default function App() {
         ". New instruction: " +
         msg +
         ". Return the complete updated note as JSON applying only the requested change. Do not alter anything that was not mentioned in the new instruction.";
-      const note = normalizeNote(await callClaudeJSON(sys, userMsg, 3));
+      const note = normalizeNote(await callGeminiJSON(sys, userMsg, 3));
       if (!note) {
         showToast("AI call failed — please retry", "error");
         setAiTyping(false);
