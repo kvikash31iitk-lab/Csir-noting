@@ -66,6 +66,19 @@
       else localStorage.removeItem("cfg::backendUrl");
     } catch (e) {}
   }
+  function getObsidian() {
+    try {
+      return (localStorage.getItem("cfg::obsidianUrl") || "").trim();
+    } catch (e) {
+      return "";
+    }
+  }
+  function setObsidian(u) {
+    try {
+      if (u) localStorage.setItem("cfg::obsidianUrl", u.replace(/\/$/, ""));
+      else localStorage.removeItem("cfg::obsidianUrl");
+    } catch (e) {}
+  }
 
   /* On first run, default to the subscription backend so the app works out of
    * the box (no manual settings). Seeded only once, so a user who later
@@ -297,6 +310,7 @@
         "background:#fff;border-radius:12px;max-width:420px;width:100%;padding:18px;font-family:sans-serif;color:#111;";
       var key = getKey();
       var backend = getBackend();
+      var obsidian = getObsidian();
       var mode = backend
         ? "Using ChatGPT/OpenAI backend."
         : key
@@ -322,6 +336,17 @@
         ';">' +
         mode +
         " (If Backend URL is set, it takes priority; blank both = demo.)</p>" +
+        '<label style="font-size:11px;font-weight:600;color:#374151;">Obsidian Bridge URL - optional local memory (see obsidian-bridge/)</label>' +
+        '<input id="ck_obsidian" type="text" placeholder="http://localhost:8791" value="' +
+        (obsidian ? obsidian.replace(/"/g, "&quot;") : "") +
+        '" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:8px;font-size:13px;margin:4px 0 6px;"/>' +
+        '<p style="margin:0 0 12px;font-size:11px;color:' +
+        (obsidian ? "#16a34a" : "#6b7280") +
+        ';">' +
+        (obsidian
+          ? "Notes and lessons are also saved into your local Obsidian vault."
+          : "Not connected — leave blank if you don't run obsidian-bridge.") +
+        "</p>" +
         '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
         '<button id="ck_save" style="flex:1 1 45%;padding:8px;border:none;border-radius:8px;background:#2563eb;color:#fff;font-weight:600;cursor:pointer;">Save</button>' +
         '<button id="ck_local" style="flex:1 1 45%;padding:8px;border:none;border-radius:8px;background:#111827;color:#fff;font-weight:600;cursor:pointer;">Local ChatGPT</button>' +
@@ -336,6 +361,7 @@
       card.querySelector("#ck_save").onclick = function () {
         setBackend(card.querySelector("#ck_backend").value.trim());
         setKey(card.querySelector("#ck_key").value.trim());
+        setObsidian(card.querySelector("#ck_obsidian").value.trim());
         location.reload();
       };
       card.querySelector("#ck_local").onclick = function () {
@@ -346,6 +372,7 @@
       card.querySelector("#ck_clear").onclick = function () {
         setBackend("");
         setKey("");
+        setObsidian("");
         location.reload();
       };
       card.querySelector("#ck_close").onclick = function () {

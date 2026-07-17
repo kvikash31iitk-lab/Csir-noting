@@ -70,6 +70,24 @@ Then set the app Backend URL to `http://localhost:8790/generate` or click
 `Local ChatGPT` in the settings panel. This mode is local-only and depends on a
 visible browser logged in to ChatGPT.
 
+## Local Obsidian Memory (optional)
+
+If you keep an Obsidian vault on your PC, `obsidian-bridge/` connects it to
+the app: every generated note and "Teach this" lesson gets exported into the
+vault as markdown, and future generations can search the vault for relevant
+past context. See `obsidian-bridge/README.md` for setup — in short:
+
+```bash
+cd obsidian-bridge
+npm install
+cp .env.example .env   # set VAULT_PATH to your vault's folder
+npm start
+```
+
+Then set **Obsidian Bridge URL** to `http://localhost:8791` in the app's
+settings panel (⚙). Like the ChatGPT bridge, this is local-only and optional —
+leaving it blank changes nothing.
+
 ## Using the app
 
 1. (Optional) Add one or more **reference notings** to improve output quality.

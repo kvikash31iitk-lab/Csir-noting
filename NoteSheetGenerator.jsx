@@ -332,6 +332,44 @@ function setApiToken(t) {
     else localStorage.removeItem("cfg::noteToken");
   } catch (_) {}
 }
+
+/* ------------------------------------------------------------------ *
+ *  Obsidian bridge client — optional local memory (see obsidian-bridge/).
+ *  Runs on the user's own PC; every call is best-effort and never blocks or
+ *  fails the app if the bridge isn't running.
+ * ------------------------------------------------------------------ */
+function obsidianBase() {
+  try {
+    return (localStorage.getItem("cfg::obsidianUrl") || "").trim().replace(/\/$/, "");
+  } catch (_) {
+    return "";
+  }
+}
+async function obsidianExport(pathname, payload) {
+  const base = obsidianBase();
+  if (!base) return;
+  try {
+    await fetch(base + pathname, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (_) {
+    /* best-effort — the bridge may simply not be running right now */
+  }
+}
+async function obsidianSearch(q, k) {
+  const base = obsidianBase();
+  if (!base || !q) return [];
+  try {
+    const res = await fetch(base + "/search?q=" + encodeURIComponent(q) + "&k=" + (k || 5));
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data && data.results) || [];
+  } catch (_) {
+    return [];
+  }
+}
 function getStored(key) {
   try { return localStorage.getItem(key) || ""; } catch (_) { return ""; }
 }
@@ -1169,6 +1207,7 @@ export default function App() {
         /* fall back to local-only */
       }
     }
+    obsidianExport("/export/learning", { text: item.text, addedAt: item.addedAt });
     const list = (await storageGet("lib:knowledge", true)) || [];
     list.push(item);
     await storageSet("lib:knowledge", list, true);
@@ -1623,30 +1662,54 @@ export default function App() {
    * Also records them in ruleHits so the UI can show "rules used". */
   async function retrieveRuleContext(queryText) {
     setRuleHits([]);
-    if (!apiBase() || !queryText || !queryText.trim()) return "";
-    try {
-      const out = await api.searchRules(queryText, 6);
-      const results = (out && out.results) || [];
-      if (!results.length) return "";
-      setRuleHits(results);
-      // Cap each provision and the total, so a huge rulebook can never bloat the
-      // prompt (belt-and-braces with the backend's stdin handling).
-      const PER = 1800, TOTAL = 12000;
-      const blocks = results.map(
-        (r, i) =>
-          "[" + (i + 1) + "] " + (r.ruleName || "Rule") +
-          (r.label ? " — " + r.label : "") + ":\n" +
-          String(r.text || "").slice(0, PER)
-      );
-      let ctx = blocks.join("\n\n");
-      if (ctx.length > TOTAL) ctx = ctx.slice(0, TOTAL) + " …[truncated]";
-      return (
-        ". The following official rule provisions were retrieved from the office rule library and are AUTHORITATIVE. When the note relies on a rule, cite it EXACTLY as written here (e.g. 'GFR 2017 Rule 21') and never invent rule numbers. If none are relevant, do not cite any. Provisions:\n" +
-        ctx
-      );
-    } catch (e) {
-      return ""; // retrieval is best-effort; never block generation
+    if (!queryText || !queryText.trim()) return "";
+    let ctx = "";
+
+    if (apiBase()) {
+      try {
+        const out = await api.searchRules(queryText, 6);
+        const results = (out && out.results) || [];
+        if (results.length) {
+          setRuleHits(results);
+          // Cap each provision and the total, so a huge rulebook can never bloat
+          // the prompt (belt-and-braces with the backend's stdin handling).
+          const PER = 1800, TOTAL = 12000;
+          const blocks = results.map(
+            (r, i) =>
+              "[" + (i + 1) + "] " + (r.ruleName || "Rule") +
+              (r.label ? " — " + r.label : "") + ":\n" +
+              String(r.text || "").slice(0, PER)
+          );
+          let ruleCtx = blocks.join("\n\n");
+          if (ruleCtx.length > TOTAL) ruleCtx = ruleCtx.slice(0, TOTAL) + " …[truncated]";
+          ctx +=
+            ". The following official rule provisions were retrieved from the office rule library and are AUTHORITATIVE. When the note relies on a rule, cite it EXACTLY as written here (e.g. 'GFR 2017 Rule 21') and never invent rule numbers. If none are relevant, do not cite any. Provisions:\n" +
+            ruleCtx;
+        }
+      } catch (e) {
+        /* retrieval is best-effort; never block generation */
+      }
     }
+
+    if (obsidianBase()) {
+      try {
+        const hits = await obsidianSearch(queryText, 4);
+        if (hits.length) {
+          const PER = 1200, TOTAL = 6000;
+          let obCtx = hits
+            .map((h, i) => "[Obsidian " + (i + 1) + "] " + h.file + ":\n" + String(h.snippet || "").slice(0, PER))
+            .join("\n\n");
+          if (obCtx.length > TOTAL) obCtx = obCtx.slice(0, TOTAL) + " …[truncated]";
+          ctx +=
+            ". The following notes were found in the user's personal Obsidian vault — use them as HELPFUL BACKGROUND CONTEXT only (e.g. tone, prior phrasing, related facts). NEVER cite them as an official rule/GFR provision; they are not authoritative:\n" +
+            obCtx;
+        }
+      } catch (e) {
+        /* retrieval is best-effort; never block generation */
+      }
+    }
+
+    return ctx;
   }
 
   /* ============================================================== *
@@ -1794,6 +1857,14 @@ export default function App() {
           })
           .catch(() => {});
       }
+      obsidianExport("/export/note", {
+        title: note.subject || "",
+        instructions: instruction,
+        draft: JSON.stringify(note),
+        language: note.language || language,
+        chain,
+        addedAt: Date.now(),
+      });
     } catch (e) {
       showToast("AI call failed — please retry", "error");
     } finally {
@@ -2115,19 +2186,28 @@ export default function App() {
   /* ---- note history: save the current note and start a fresh one ---- */
   async function startNewNote() {
     const cur = versions[activeVersion];
-    if (cur && apiBase() && apiToken()) {
-      try {
-        const firstInstr =
-          (chatHistory.find((c) => c.role === "user") || {}).text || "";
-        await api.addNote({
-          title: cur.subject || "Untitled note",
-          instructions: firstInstr,
-          draft: JSON.stringify(cur),
-          final: JSON.stringify(cur),
-        });
-      } catch (e) {
-        /* non-fatal — still start fresh */
+    if (cur) {
+      const firstInstr = (chatHistory.find((c) => c.role === "user") || {}).text || "";
+      if (apiBase() && apiToken()) {
+        try {
+          await api.addNote({
+            title: cur.subject || "Untitled note",
+            instructions: firstInstr,
+            draft: JSON.stringify(cur),
+            final: JSON.stringify(cur),
+          });
+        } catch (e) {
+          /* non-fatal — still start fresh */
+        }
       }
+      obsidianExport("/export/note", {
+        title: cur.subject || "Untitled note",
+        instructions: firstInstr,
+        draft: JSON.stringify(cur),
+        final: JSON.stringify(cur),
+        language: cur.language || language,
+        addedAt: Date.now(),
+      });
     }
     sessionIdRef.current = generateUUID();
     setVersions([]);

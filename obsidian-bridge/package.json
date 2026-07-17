@@ -1,0 +1,11 @@
+{
+  "name": "csir-obsidian-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local bridge that exports CSIR Note Sheet notes/learning into an Obsidian vault, and lets the app search that vault for context.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
