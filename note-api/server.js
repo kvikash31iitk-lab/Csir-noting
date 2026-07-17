@@ -1,14 +1,20 @@
 /*
  * CSIR Note Sheet — backend "brain" for the note-sheet app
  * --------------------------------------------------------
- * Calls the OpenAI Responses API (ChatGPT models) and keeps a small,
- * file-based memory so the app
- * becomes a growing institutional assistant.
+ * Generation is provider-selectable via AI_PROVIDER:
+ *   "antigravity" (default) — runs the `agy` (Antigravity CLI) binary, logged
+ *     in via "Login with Google" against a Gemini/Antigravity subscription,
+ *     so no per-call API billing. See the runAgy() block below for its known
+ *     quirks (argv-only prompt, permission-gated file reads, etc).
+ *   "openai" — calls the OpenAI Responses API directly with OPENAI_API_KEY
+ *     (real per-call billing).
+ * Also keeps a small, file-based memory so the app becomes a growing
+ * institutional assistant.
  *
  * Endpoints
- *   GET  /health                      liveness
+ *   GET  /health                      liveness + active provider info
  *   POST /generate {system,user}      stateless text/JSON generation (unchanged)
- *   POST /extract  {dataUrl|base64}   OCR a scan/image/PDF via OpenAI vision
+ *   POST /extract  {dataUrl|base64}   OCR a scan/image/PDF via the active provider
  *   POST /login    {password}         -> { token }  (Bearer for the routes below)
  *   GET  /brain                       full memory (learning, references, rules, notes)
  *   POST /brain/learning {text}       add a standing instruction
@@ -22,15 +28,20 @@
  *   GET  /backup                      download the whole brain as JSON
  *
  * Config (environment variables):
- *   PORT, ALLOWED_ORIGIN, OPENAI_API_KEY, OPENAI_MODEL, OPENAI_VISION_MODEL,
- *   OPENAI_BASE_URL, OPENAI_MAX_OUTPUT_TOKENS, OCR_TIMEOUT_MS,
+ *   PORT, ALLOWED_ORIGIN, AI_PROVIDER (antigravity|openai), TIMEOUT_MS,
+ *   OCR_TIMEOUT_MS,
+ *   AGY_BIN, AGY_MODEL, AGY_EXTRA_ARGS, AGY_INLINE_LIMIT   (antigravity)
+ *   OPENAI_API_KEY, OPENAI_MODEL, OPENAI_VISION_MODEL,
+ *   OPENAI_BASE_URL, OPENAI_MAX_OUTPUT_TOKENS               (openai)
  *   APP_PASSWORD   password gating the /brain + /extract routes (unset = open)
  *   APP_SECRET     HMAC secret for tokens (defaults derived from APP_PASSWORD)
  *   DATA_DIR       where brain.json lives (default ./data)
  */
 const express = require("express");
+const { spawn } = require("child_process");
 const crypto = require("crypto");
 const https = require("https");
+const os = require("os");
 const fs = require("fs");
 const path = require("path");
 
@@ -55,6 +66,25 @@ loadDotEnv(path.join(__dirname, ".env"));
 
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "120000", 10);
+
+// Which backend generates text: "antigravity" (subscription CLI, no per-call
+// billing — the default) or "openai" (real API-key billing).
+const AI_PROVIDER = (process.env.AI_PROVIDER || "antigravity").trim().toLowerCase();
+
+// --- antigravity (agy) config ---
+// Prefer an absolute path here (e.g. /root/.local/bin/agy) — pm2's environment
+// often doesn't carry the interactive shell's PATH additions.
+const AGY_BIN = process.env.AGY_BIN || "agy";
+const AGY_MODEL = process.env.AGY_MODEL || ""; // must exactly match a name from `agy models`
+const AGY_EXTRA_ARGS = (process.env.AGY_EXTRA_ARGS || "").split(" ").filter(Boolean);
+// Prompts at or under this many characters go straight on the CLI argv; longer
+// ones are written to a temp file and referenced via @/abs/path instead, to
+// stay well clear of the OS arg-length limit (E2BIG), which is typically ~2MB
+// on Linux but shrinks with a large environment block.
+const AGY_INLINE_LIMIT = parseInt(process.env.AGY_INLINE_LIMIT || "100000", 10);
+
+// --- openai config ---
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.5";
@@ -62,7 +92,13 @@ const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || OPENAI_MODEL;
 const OPENAI_MAX_OUTPUT_TOKENS = parseInt(process.env.OPENAI_MAX_OUTPUT_TOKENS || "4000", 10);
 const OPENAI_OCR_MAX_OUTPUT_TOKENS = parseInt(process.env.OPENAI_OCR_MAX_OUTPUT_TOKENS || "6000", 10);
 const OPENAI_REASONING_EFFORT = process.env.OPENAI_REASONING_EFFORT || "";
-const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "120000", 10);
+
+// Fixed identity/formatting instruction prepended to every /generate prompt,
+// regardless of provider.
+const BASE_SYSTEM =
+  "You are a precise writing assistant for Indian government office notings. " +
+  "Follow the instructions in the user message exactly and output ONLY what is " +
+  "requested (raw JSON when asked) — no preamble, no markdown, no code fences.";
 
 // --- accounts ---
 // Built-in users (override with a USERS env var: JSON array of
@@ -111,9 +147,25 @@ if (!process.env.APP_SECRET) {
   );
 }
 
-if (!OPENAI_API_KEY) {
-  console.warn("[AI] OPENAI_API_KEY is unset. /generate and /extract will fail until it is configured.");
+if (AI_PROVIDER === "openai" && !OPENAI_API_KEY) {
+  console.warn("[AI] AI_PROVIDER=openai but OPENAI_API_KEY is unset. /generate and /extract will fail until it is configured.");
+} else if (AI_PROVIDER !== "openai" && AI_PROVIDER !== "antigravity") {
+  console.warn("[AI] Unknown AI_PROVIDER '" + AI_PROVIDER + "' — falling back to antigravity behavior.");
 }
+if (AI_PROVIDER !== "openai") {
+  console.warn(
+    "[SECURITY] Requests that reference a file (oversized /generate prompts, all " +
+    "/extract OCR calls) run agy with --dangerously-skip-permissions, which " +
+    "auto-approves ALL tool calls, not just the file read — a prompt-injection " +
+    "risk from untrusted uploaded document text. Ordinary /generate calls do not " +
+    "use this flag. See note-api/README.md."
+  );
+}
+
+// Neutral, empty working dir so agy's /generate calls have no project/code to
+// "look at" (antigravity only).
+const NEUTRAL_CWD = process.env.AGY_CWD || path.join(os.tmpdir(), "csir-note-api-cwd");
+try { fs.mkdirSync(NEUTRAL_CWD, { recursive: true }); } catch (_) {}
 
 /* ------------------------------------------------------------------ *
  *  File-based memory ("the brain")
@@ -318,6 +370,54 @@ async function callOpenAIResponses({ instructions, input, model, maxOutputTokens
 }
 
 /* ------------------------------------------------------------------ *
+ *  Antigravity CLI (`agy`) runner (used by /generate and /extract when
+ *  AI_PROVIDER=antigravity)
+ *
+ *  `-p` takes the prompt as a literal argv string — there is no STDIN
+ *  support (confirmed: piping without an explicit -p value errors with
+ *  "flag needs an argument: -p"). Output is plain text on stdout, not JSON.
+ *  needsFileTools must be true whenever promptText contains an `@/abs/path`
+ *  reference, since reading it is permission-gated and headless mode cannot
+ *  answer the interactive approval prompt (it hangs otherwise). A RELATIVE
+ *  @path triggers a slow whole-filesystem search in this CLI version —
+ *  always use absolute paths.
+ * ------------------------------------------------------------------ */
+function runAgy({ promptText, cwd, timeoutMs, needsFileTools }) {
+  return new Promise((resolve, reject) => {
+    const effTimeout = timeoutMs || TIMEOUT_MS;
+    const args = ["-p", promptText, "--print-timeout", Math.ceil(effTimeout / 1000) + "s"];
+    if (AGY_MODEL) args.push("--model", AGY_MODEL);
+    if (needsFileTools) args.push("--dangerously-skip-permissions", "--sandbox");
+    args.push(...AGY_EXTRA_ARGS);
+    const env = Object.assign({}, process.env);
+
+    let child;
+    try { child = spawn(AGY_BIN, args, { env, cwd: cwd || NEUTRAL_CWD }); }
+    catch (e) { return reject(new Error("could not start agy: " + e.message)); }
+
+    let out = "", err = "", finished = false;
+    const fin = (fn) => { if (!finished) { finished = true; fn(); } };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch (_) {}
+      fin(() => reject(new Error("agy timed out")));
+    }, effTimeout);
+
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("error", (e) => { clearTimeout(timer); fin(() => reject(new Error("agy spawn error: " + e.message))); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0)
+        return fin(() => reject(new Error("agy exited " + code + ": " + (err || out).slice(0, 400))));
+      fin(() => resolve(out.trim()));
+    });
+
+    try { child.stdin.end(); } // -p takes the prompt as an argument, not stdin
+    catch (_) {}
+  });
+}
+
+/* ------------------------------------------------------------------ *
  *  Simple in-memory per-IP rate limiter (no external dependency)
  * ------------------------------------------------------------------ */
 const _rlBuckets = new Map();
@@ -359,16 +459,23 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/health", (_req, res) =>
-  res.json({
+app.get("/health", (_req, res) => {
+  const info = {
     ok: true,
     users: USERS.length,
     google: !!GOOGLE_CLIENT_ID,
-    ai: "openai",
-    model: OPENAI_MODEL,
-    visionModel: OPENAI_VISION_MODEL,
-    openaiConfigured: !!OPENAI_API_KEY,
-  }));
+    ai: AI_PROVIDER,
+  };
+  if (AI_PROVIDER === "openai") {
+    info.model = OPENAI_MODEL;
+    info.visionModel = OPENAI_VISION_MODEL;
+    info.openaiConfigured = !!OPENAI_API_KEY;
+  } else {
+    info.agyBin = AGY_BIN;
+    info.model = AGY_MODEL || "(agy default)";
+  }
+  res.json(info);
+});
 
 // --- generation (now authenticated + rate-limited; was previously open) ---
 app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, async (req, res) => {
@@ -377,20 +484,33 @@ app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, asyn
   const user = typeof body.user === "string" ? body.user : "";
   if (!user) return res.status(400).json({ error: "missing 'user' prompt" });
 
-  // Keep a fixed top-level instruction and append the app's larger prompt as
-  // request-body instructions, so large rule/context payloads stay safe.
-  const BASE_SYSTEM =
-    "You are a precise writing assistant for Indian government office notings. " +
-    "Follow the instructions in the user message exactly and output ONLY what is " +
-    "requested (raw JSON when asked) — no preamble, no markdown, no code fences.";
+  let tmpFile = null;
   try {
-    const text = await callOpenAIResponses({
-      instructions: BASE_SYSTEM + (system ? "\n\n" + system : ""),
-      input: user,
-      model: OPENAI_MODEL,
-      maxOutputTokens: OPENAI_MAX_OUTPUT_TOKENS,
-      timeoutMs: TIMEOUT_MS,
-    });
+    let text;
+    if (AI_PROVIDER === "openai") {
+      text = await callOpenAIResponses({
+        instructions: BASE_SYSTEM + (system ? "\n\n" + system : ""),
+        input: user,
+        model: OPENAI_MODEL,
+        maxOutputTokens: OPENAI_MAX_OUTPUT_TOKENS,
+        timeoutMs: TIMEOUT_MS,
+      });
+    } else {
+      const combined = system ? system + "\n\n=====\n\n" + user : user;
+      const full = BASE_SYSTEM + "\n\n=====\n\n" + combined;
+      // Small enough to go straight on argv; oversized prompts (big rulebook/RAG
+      // context) are written to a temp file and referenced via @/abs/path instead,
+      // to stay clear of the OS arg-length limit (E2BIG) — agy's -p has no STDIN
+      // fallback, so this is the only way to keep large payloads off argv.
+      let promptText = full, needsFileTools = false;
+      if (full.length > AGY_INLINE_LIMIT) {
+        tmpFile = path.join(NEUTRAL_CWD, "prompt-" + newId() + ".txt");
+        fs.writeFileSync(tmpFile, full);
+        promptText = BASE_SYSTEM + "\n\nFollow the instructions in @" + tmpFile + " exactly.";
+        needsFileTools = true;
+      }
+      text = await runAgy({ promptText, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS, needsFileTools });
+    }
     res.json({ content: [{ type: "text", text }] });
   } catch (e) {
     console.error("[generate] error:", (e && e.stack) || e);
@@ -403,10 +523,12 @@ app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, asyn
     if (/timed out|timeout/i.test(msg))
       return res.status(504).json({ error: "AI timed out - try a shorter note", code: "timeout" });
     res.status(500).json({ error: "generation failed", code: "error" });
+  } finally {
+    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch (_) {} }
   }
 });
 
-// --- OCR via OpenAI vision/file inputs ---
+// --- OCR via the active provider's vision/file input ---
 app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async (req, res) => {
   const b = req.body || {};
   let raw = b.dataUrl || b.imageBase64 || b.base64 || "";
@@ -423,30 +545,38 @@ app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async
   if (ext === "jpeg") ext = "jpg";
   if (!ext) ext = "png";
 
+  const ocrPrompt =
+    "Transcribe ALL text from the attached " + (ext === "pdf" ? "PDF" : "image") +
+    " verbatim, preserving line breaks and layout where reasonable. It may " +
+    "contain a mix of English and Hindi (Devanagari) — transcribe both faithfully. " +
+    "Do not summarise, translate, or add commentary. Output ONLY the transcribed text.";
+  const ocrTimeoutMs = parseInt(process.env.OCR_TIMEOUT_MS || "180000", 10);
+
+  let dir = null;
   try {
-    if (!mime) mime = ext === "pdf" ? "application/pdf" : "image/" + ext;
-    const dataUrl = "data:" + mime + ";base64," + raw;
-    const filename = String(b.filename || ("upload." + ext)).replace(/[^\w.\- ()]/g, "_");
-    const prompt =
-      "Transcribe ALL text from the attached " + (ext === "pdf" ? "PDF" : "image") +
-      " verbatim, preserving line breaks and layout where reasonable. It may " +
-      "contain a mix of English and Hindi (Devanagari) — transcribe both faithfully. " +
-      "Do not summarise, translate, or add commentary. Output ONLY the transcribed text.";
-    const filePart = ext === "pdf"
-      ? { type: "input_file", filename, file_data: dataUrl, detail: "high" }
-      : { type: "input_image", image_url: dataUrl };
-    const text = await callOpenAIResponses({
-      input: [{
-        role: "user",
-        content: [
-          filePart,
-          { type: "input_text", text: prompt },
-        ],
-      }],
-      model: OPENAI_VISION_MODEL,
-      maxOutputTokens: OPENAI_OCR_MAX_OUTPUT_TOKENS,
-      timeoutMs: parseInt(process.env.OCR_TIMEOUT_MS || "180000", 10),
-    });
+    let text;
+    if (AI_PROVIDER === "openai") {
+      if (!mime) mime = ext === "pdf" ? "application/pdf" : "image/" + ext;
+      const dataUrl = "data:" + mime + ";base64," + raw;
+      const filename = String(b.filename || ("upload." + ext)).replace(/[^\w.\- ()]/g, "_");
+      const filePart = ext === "pdf"
+        ? { type: "input_file", filename, file_data: dataUrl, detail: "high" }
+        : { type: "input_image", image_url: dataUrl };
+      text = await callOpenAIResponses({
+        input: [{ role: "user", content: [filePart, { type: "input_text", text: ocrPrompt }] }],
+        model: OPENAI_VISION_MODEL,
+        maxOutputTokens: OPENAI_OCR_MAX_OUTPUT_TOKENS,
+        timeoutMs: ocrTimeoutMs,
+      });
+    } else {
+      // agy needs a real file to @-reference (absolute path — a relative one
+      // triggers a slow whole-filesystem search in this CLI version).
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), "ocr-"));
+      const fpath = path.join(dir, "page." + ext);
+      fs.writeFileSync(fpath, Buffer.from(raw, "base64"));
+      const prompt = "Transcribe ALL of the text in @" + fpath + " verbatim. " + ocrPrompt;
+      text = await runAgy({ promptText: prompt, cwd: dir, timeoutMs: ocrTimeoutMs, needsFileTools: true });
+    }
     res.json({ text: String(text || "").trim() });
   } catch (e) {
     console.error("[extract] error:", (e && e.stack) || e);
@@ -458,6 +588,8 @@ app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async
     if (/timed out|timeout/i.test(msg))
       return res.status(504).json({ error: "OCR timed out - try a smaller file", code: "timeout" });
     res.status(500).json({ error: "ocr failed", code: "error" });
+  } finally {
+    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} }
   }
 });
 
@@ -585,6 +717,7 @@ app.listen(PORT, () => {
     "csir-note-api listening on :" + PORT +
     " (origin: " + ALLOWED_ORIGIN + ", users: " + USERS.length +
     ", google: " + (GOOGLE_CLIENT_ID ? "on" : "off") +
+    ", ai: " + AI_PROVIDER +
     ", data: " + DATA_DIR + ")"
   );
 });

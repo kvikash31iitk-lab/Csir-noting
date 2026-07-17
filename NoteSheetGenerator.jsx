@@ -8,7 +8,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
  *
  * - Learns style/format from uploaded reference notings
  * - Extracts facts from a source document
- * - Generates a formatted note sheet via ChatGPT/OpenAI
+ * - Generates a formatted note sheet via the note-api backend's AI
  * - Allows chat-based iterative refinement
  * - Exports the final note as a DOCX file
  *
@@ -21,7 +21,8 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
  *  CONSTANTS
  * ------------------------------------------------------------------ */
 // Kept only so the Android/web wrapper can intercept older artifact calls and
-// route them to the configured ChatGPT/OpenAI backend or demo mode.
+// route them to the configured note-api backend (whichever AI_PROVIDER it
+// runs — see note-api/README.md) or demo mode.
 const LEGACY_AI_URL = "https://api.anthropic.com/v1/messages";
 const LEGACY_AI_MODEL = "legacy-wrapper";
 const AI_MAX_TOKENS = 2000;
@@ -280,7 +281,7 @@ async function callAIJSON(systemPrompt, userMessage, attempts) {
 }
 
 /* ------------------------------------------------------------------ *
- *  Brain API client — server-side memory, rule library, OpenAI OCR.
+ *  Brain API client — server-side memory, rule library, backend OCR.
  *  The base URL is derived from the configured backend (…/generate ->
  *  its root); the login token is kept in localStorage.
  * ------------------------------------------------------------------ */
@@ -384,11 +385,11 @@ function fileToDataUrl(file) {
     r.readAsDataURL(file);
   });
 }
-/* OpenAI vision OCR via the backend (primary engine). Returns "" if no backend
- * is configured or the call is rejected, so the caller can fall back locally. */
+/* Backend-vision OCR (primary engine). Returns "" if no backend is configured
+ * or the call is rejected, so the caller can fall back locally. */
 async function ocrViaBackend(file, onStatus) {
   if (!apiBase()) return "";
-  if (typeof onStatus === "function") onStatus("Reading with ChatGPT vision...");
+  if (typeof onStatus === "function") onStatus("Reading with AI vision...");
   const dataUrl = await fileToDataUrl(file);
   const out = await api.extract({
     dataUrl,
@@ -481,7 +482,7 @@ async function readSpreadsheet(file) {
 
 /* Local OCR via tesseract.js. Handles image files directly and scanned PDFs by
  * rendering each page to a canvas first (PDF.js). Used as the fallback OCR
- * engine; OpenAI vision is the primary path. */
+ * engine; backend vision is the primary path. */
 async function ocrWithTesseract(file, onStatus) {
   await loadScript(TESSERACT_CDN);
   if (!window.Tesseract) throw new Error("ocr unavailable");
@@ -522,12 +523,12 @@ async function ocrWithTesseract(file, onStatus) {
   return ((res && res.data && res.data.text) || "").trim();
 }
 
-/* OCR dispatcher. OpenAI vision (the better engine for Hindi / messy govt
+/* OCR dispatcher. Backend vision (the better engine for Hindi / messy govt
  * scans) is the primary path; tesseract.js is the local fallback. */
 async function ocrFile(file, onStatus) {
   try {
-    const viaOpenAI = await ocrViaBackend(file, onStatus);
-    if (viaOpenAI && viaOpenAI.replace(/\s/g, "").length >= 5) return viaOpenAI;
+    const viaBackend = await ocrViaBackend(file, onStatus);
+    if (viaBackend && viaBackend.replace(/\s/g, "").length >= 5) return viaBackend;
   } catch (_) {
     /* fall back to local OCR */
   }

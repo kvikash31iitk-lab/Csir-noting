@@ -2,7 +2,7 @@
   "name": "csir-note-api",
   "version": "1.0.0",
   "private": true,
-  "description": "Tiny backend that generates note sheets via OpenAI ChatGPT models.",
+  "description": "Tiny backend that generates note sheets via a selectable AI provider (Antigravity CLI subscription by default, or OpenAI API key).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
