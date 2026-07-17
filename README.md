@@ -5,7 +5,7 @@ generate formal **"noting"** documents (internal office note sheets). It:
 
 1. **Learns** style and format from uploaded reference noting documents
 2. **Extracts** facts from a user-uploaded source document
-3. **Generates** a formatted note sheet via Gemini
+3. **Generates** a formatted note sheet via the note-api backend's AI
 4. Allows **chat-based iteration** and refinement
 5. **Exports** the final note as a downloadable DOCX file
 
@@ -26,10 +26,12 @@ generate formal **"noting"** documents (internal office note sheets). It:
   `sessionStorage` — the `index.html` harness provides a `window.storage` shim
   for local testing only.
 - **AI:** posts `{system, user}` to the `note-api` backend's `POST /generate`
-  (see `note-api/`), which runs the `gemini` CLI on the server, billed to a
-  Gemini subscription. No API key is referenced anywhere in this repo — the
-  VPS's logged-in Gemini CLI supplies authentication. The Backend URL and a
-  signed-in session are required for generation; there is no local/offline AI.
+  (see `note-api/`), which runs an AI CLI on the server, billed to a
+  subscription — currently the Antigravity CLI (`agy`); see
+  `note-api/README.md` for why and how to swap it if the provider changes
+  again. No API key is referenced anywhere in this repo — the VPS's logged-in
+  CLI session supplies authentication. The Backend URL and a signed-in session
+  are required for generation; there is no local/offline AI.
 - **Documents:** reads `.docx` via mammoth.js and `.pdf`/text via the
   `FileReader` API; writes `.docx` via docx.js (falling back to `.txt` if DOCX
   generation fails).

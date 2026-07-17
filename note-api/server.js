@@ -1,14 +1,24 @@
 /*
  * CSIR Note Sheet — backend "brain" for the note-sheet app
  * --------------------------------------------------------
- * Runs the `gemini` CLI (logged in via "Login with Google" against a Gemini
- * subscription, so NO GEMINI_API_KEY is needed) and keeps a small, file-based
- * memory so the app becomes a growing institutional assistant.
+ * Runs the `agy` (Antigravity CLI) binary, logged in via "Login with Google"
+ * against a Gemini/Antigravity subscription, so no per-call API billing.
+ *
+ * IMPORTANT — agy's `-p` flag only accepts the prompt as a literal argument
+ * (no STDIN support), and reading a file via its `@/abs/path` syntax needs
+ * --dangerously-skip-permissions to run unattended (headless mode can't
+ * answer agy's interactive approval prompt, so without the flag it just
+ * hangs until the timeout). That flag auto-approves ALL tool calls, not just
+ * file reads, so we only pass it on requests that actually reference a file
+ * (oversized /generate prompts, and every /extract OCR call) — ordinary
+ * /generate calls stay on agy's default deny-by-default permission model.
+ * A RELATIVE @path triggers a slow whole-filesystem search in this CLI
+ * version; always use absolute paths.
  *
  * Endpoints
  *   GET  /health                      liveness
  *   POST /generate {system,user}      stateless text/JSON generation (unchanged)
- *   POST /extract  {dataUrl|base64}   OCR a scan/image/PDF via Gemini vision
+ *   POST /extract  {dataUrl|base64}   OCR a scan/image/PDF via Antigravity vision
  *   POST /login    {password}         -> { token }  (Bearer for the routes below)
  *   GET  /brain                       full memory (learning, references, rules, notes)
  *   POST /brain/learning {text}       add a standing instruction
@@ -22,13 +32,14 @@
  *   GET  /backup                      download the whole brain as JSON
  *
  * Config (environment variables):
- *   PORT, ALLOWED_ORIGIN, GEMINI_BIN, GEMINI_MODEL, GEMINI_EXTRA_ARGS,
+ *   PORT, ALLOWED_ORIGIN, AGY_BIN, AGY_MODEL, AGY_EXTRA_ARGS, AGY_INLINE_LIMIT,
  *   TIMEOUT_MS,
  *   APP_PASSWORD   password gating the /brain + /extract routes (unset = open)
  *   APP_SECRET     HMAC secret for tokens (defaults derived from APP_PASSWORD)
  *   DATA_DIR       where brain.json lives (default ./data)
  *   OCR_TIMEOUT_MS (default 180000)
  */
+try { require("dotenv").config(); } catch (_) {} // load .env if present; harmless if dotenv/.env is missing
 const express = require("express");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
@@ -39,10 +50,17 @@ const path = require("path");
 
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
-const GEMINI_BIN = process.env.GEMINI_BIN || "gemini";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "";
-const EXTRA_ARGS = (process.env.GEMINI_EXTRA_ARGS || "").split(" ").filter(Boolean);
+// Prefer an absolute path here (e.g. /root/.local/bin/agy) — pm2's environment
+// often doesn't carry the interactive shell's PATH additions.
+const AGY_BIN = process.env.AGY_BIN || "agy";
+const AGY_MODEL = process.env.AGY_MODEL || ""; // must exactly match a name from `agy models`
+const EXTRA_ARGS = (process.env.AGY_EXTRA_ARGS || "").split(" ").filter(Boolean);
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || "120000", 10);
+// Prompts at or under this many characters go straight on the CLI argv; longer
+// ones are written to a temp file and referenced via @/abs/path instead, to
+// stay well clear of the OS arg-length limit (E2BIG), which is typically ~2MB
+// on Linux but shrinks with a large environment block.
+const INLINE_LIMIT = parseInt(process.env.AGY_INLINE_LIMIT || "100000", 10);
 
 // --- accounts ---
 // Built-in users (override with a USERS env var: JSON array of
@@ -90,22 +108,26 @@ if (!process.env.APP_SECRET) {
     "tokens are forgeable from the source. Set APP_SECRET=$(openssl rand -hex 32)."
   );
 }
+console.warn(
+  "[SECURITY] Requests that reference a file (oversized /generate prompts, all " +
+  "/extract OCR calls) run agy with --dangerously-skip-permissions, which " +
+  "auto-approves ALL tool calls, not just the file read — a prompt-injection " +
+  "risk from untrusted uploaded document text. Ordinary /generate calls do not " +
+  "use this flag."
+);
 
 // Neutral, empty working dir so /generate has no project/code to "look at".
 const NEUTRAL_CWD =
-  process.env.GEMINI_CWD || path.join(os.tmpdir(), "csir-note-api-cwd");
+  process.env.AGY_CWD || path.join(os.tmpdir(), "csir-note-api-cwd");
 try { fs.mkdirSync(NEUTRAL_CWD, { recursive: true }); } catch (_) {}
 
-// Small, fixed system prompt (replaces Gemini CLI's coding-agent default via
-// GEMINI_SYSTEM_MD). The caller's possibly-huge system prompt still goes over
-// STDIN with the user message on every /generate call — this file never changes,
-// so it never needs to be rewritten per-request.
+// Antigravity CLI has no confirmed separate system-prompt mechanism, so this
+// fixed identity/formatting instruction is prepended to every prompt we send
+// (inline or file-based) instead of being passed as its own flag.
 const BASE_SYSTEM =
   "You are a precise writing assistant for Indian government office notings. " +
   "Follow the instructions in the user message exactly and output ONLY what is " +
   "requested (raw JSON when asked) — no preamble, no markdown, no code fences.";
-const SYSTEM_MD_FILE = path.join(NEUTRAL_CWD, "system.md");
-try { fs.writeFileSync(SYSTEM_MD_FILE, BASE_SYSTEM); } catch (_) {}
 
 /* ------------------------------------------------------------------ *
  *  File-based memory ("the brain")
@@ -247,52 +269,47 @@ async function verifyGoogleCredential(credential) {
 }
 
 /* ------------------------------------------------------------------ *
- *  Gemini CLI runner (used by /generate and /extract)
+ *  Antigravity CLI (`agy`) runner (used by /generate and /extract)
  *
- *  Headless mode is triggered by piping the prompt over STDIN with no TTY
- *  attached (spawn() gives it pipes, never a TTY) — this also keeps large
- *  system/user content off the CLI argv, avoiding an OS arg-length (E2BIG)
- *  failure the same way a large-argv payload would with any CLI.
+ *  `-p` takes the prompt as a literal argv string — there is no STDIN
+ *  support (confirmed: piping without an explicit -p value errors with
+ *  "flag needs an argument: -p"). Output is plain text on stdout, not JSON.
+ *  needsFileTools must be true whenever promptText contains an `@/abs/path`
+ *  reference, since reading it is permission-gated and headless mode cannot
+ *  answer the interactive approval prompt (it hangs otherwise).
  * ------------------------------------------------------------------ */
-function runGemini({ args, stdin, cwd, timeoutMs, systemMdFile }) {
+function runAgy({ promptText, cwd, timeoutMs, needsFileTools }) {
   return new Promise((resolve, reject) => {
-    const fullArgs = args.slice();
-    if (GEMINI_MODEL && fullArgs.indexOf("--model") === -1) fullArgs.push("--model", GEMINI_MODEL);
-    fullArgs.push(...EXTRA_ARGS);
+    const effTimeout = timeoutMs || TIMEOUT_MS;
+    const args = ["-p", promptText, "--print-timeout", Math.ceil(effTimeout / 1000) + "s"];
+    if (AGY_MODEL) args.push("--model", AGY_MODEL);
+    if (needsFileTools) args.push("--dangerously-skip-permissions", "--sandbox");
+    args.push(...EXTRA_ARGS);
     const env = Object.assign({}, process.env);
-    delete env.GEMINI_API_KEY; // force subscription (OAuth "Login with Google") auth
-    if (systemMdFile) env.GEMINI_SYSTEM_MD = systemMdFile;
 
     let child;
-    try { child = spawn(GEMINI_BIN, fullArgs, { env, cwd: cwd || NEUTRAL_CWD }); }
-    catch (e) { return reject(new Error("could not start gemini: " + e.message)); }
+    try { child = spawn(AGY_BIN, args, { env, cwd: cwd || NEUTRAL_CWD }); }
+    catch (e) { return reject(new Error("could not start agy: " + e.message)); }
 
     let out = "", err = "", finished = false;
     const fin = (fn) => { if (!finished) { finished = true; fn(); } };
     const timer = setTimeout(() => {
       try { child.kill("SIGKILL"); } catch (_) {}
-      fin(() => reject(new Error("gemini timed out")));
-    }, timeoutMs || TIMEOUT_MS);
+      fin(() => reject(new Error("agy timed out")));
+    }, effTimeout);
 
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => { err += d; });
-    child.on("error", (e) => { clearTimeout(timer); fin(() => reject(new Error("gemini spawn error: " + e.message))); });
+    child.on("error", (e) => { clearTimeout(timer); fin(() => reject(new Error("agy spawn error: " + e.message))); });
     child.on("close", (code) => {
       clearTimeout(timer);
-      let text = out, apiErr = null;
-      try {
-        const j = JSON.parse(out);
-        if (j.error) apiErr = j.error.message || JSON.stringify(j.error);
-        text = j.response != null ? j.response : (j.result || j.text || out);
-      } catch (_) {}
-      if (apiErr) return fin(() => reject(new Error(apiErr)));
-      if (code !== 0 && !text)
-        return fin(() => reject(new Error("gemini exited " + code + ": " + err.slice(0, 400))));
-      fin(() => resolve(text));
+      if (code !== 0)
+        return fin(() => reject(new Error("agy exited " + code + ": " + (err || out).slice(0, 400))));
+      fin(() => resolve(out.trim()));
     });
 
-    try { if (stdin != null) child.stdin.write(stdin); child.stdin.end(); }
-    catch (e) { clearTimeout(timer); fin(() => reject(new Error("failed writing prompt: " + e.message))); }
+    try { child.stdin.end(); } // -p takes the prompt as an argument, not stdin
+    catch (_) {}
   });
 }
 
@@ -348,16 +365,23 @@ app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, asyn
   const user = typeof body.user === "string" ? body.user : "";
   if (!user) return res.status(400).json({ error: "missing 'user' prompt" });
 
-  // BASE_SYSTEM (fixed) is supplied via GEMINI_SYSTEM_MD; the caller's possibly-huge
-  // system prompt is combined with the user message and sent over STDIN only, so a
-  // large rule/context payload can never overflow the OS arg limit (E2BIG).
-  const args = ["--output-format", "json", "--approval-mode", "default"];
   const combined = system ? system + "\n\n=====\n\n" + user : user;
+  const full = BASE_SYSTEM + "\n\n=====\n\n" + combined;
+
+  // Small enough to go straight on argv; oversized prompts (big rulebook/RAG
+  // context) are written to a temp file and referenced via @/abs/path instead,
+  // to stay clear of the OS arg-length limit (E2BIG) — agy's -p has no STDIN
+  // fallback, so this is the only way to keep large payloads off argv.
+  let tmpFile = null, promptText = full, needsFileTools = false;
+  if (full.length > INLINE_LIMIT) {
+    tmpFile = path.join(NEUTRAL_CWD, "prompt-" + newId() + ".txt");
+    fs.writeFileSync(tmpFile, full);
+    promptText = BASE_SYSTEM + "\n\nFollow the instructions in @" + tmpFile + " exactly.";
+    needsFileTools = true;
+  }
 
   try {
-    const text = await runGemini({
-      args, stdin: combined, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS, systemMdFile: SYSTEM_MD_FILE,
-    });
+    const text = await runAgy({ promptText, cwd: NEUTRAL_CWD, timeoutMs: TIMEOUT_MS, needsFileTools });
     res.json({ content: [{ type: "text", text }] });
   } catch (e) {
     console.error("[generate] error:", (e && e.stack) || e);
@@ -368,10 +392,12 @@ app.post("/generate", rateLimit({ windowMs: 60000, max: 40 }), requireAuth, asyn
     if (/timed out/i.test(msg))
       return res.status(504).json({ error: "AI timed out — try a shorter note", code: "timeout" });
     res.status(500).json({ error: "generation failed", code: "error" });
+  } finally {
+    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch (_) {} }
   }
 });
 
-// --- OCR via Gemini vision (@-file reference to a temp file) ---
+// --- OCR via Antigravity vision (@-file reference to a temp file) ---
 app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async (req, res) => {
   const b = req.body || {};
   let raw = b.dataUrl || b.imageBase64 || b.base64 || "";
@@ -388,21 +414,21 @@ app.post("/extract", rateLimit({ windowMs: 60000, max: 20 }), requireAuth, async
   if (ext === "jpeg") ext = "jpg";
   if (!ext) ext = "png";
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ocr-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ocr-")); // absolute path
   const fname = "page." + ext;
-  const fpath = path.join(dir, fname);
+  const fpath = path.join(dir, fname); // absolute — required for a direct @-read, not a filesystem search
   try {
     fs.writeFileSync(fpath, Buffer.from(raw, "base64"));
     const prompt =
-      "Transcribe ALL of the text in @" + fname + " verbatim, preserving line breaks " +
+      "Transcribe ALL of the text in @" + fpath + " verbatim, preserving line breaks " +
       "and layout where reasonable. It may contain a mix of English and Hindi " +
       "(Devanagari) — transcribe both faithfully. Do not summarise, translate, or add " +
       "commentary. Output ONLY the transcribed text.";
-    const text = await runGemini({
-      args: ["--output-format", "json", "--approval-mode", "default"],
-      stdin: prompt,
+    const text = await runAgy({
+      promptText: prompt,
       cwd: dir,
       timeoutMs: parseInt(process.env.OCR_TIMEOUT_MS || "180000", 10),
+      needsFileTools: true,
     });
     res.json({ text: String(text || "").trim() });
   } catch (e) {
@@ -537,7 +563,7 @@ app.listen(PORT, () => {
     "csir-note-api listening on :" + PORT +
     " (origin: " + ALLOWED_ORIGIN + ", users: " + USERS.length +
     ", google login: " + (GOOGLE_CLIENT_ID ? "on" : "off") +
-    ", gemini bin: " + GEMINI_BIN +
+    ", agy bin: " + AGY_BIN +
     ", data: " + DATA_DIR + ")"
   );
 });

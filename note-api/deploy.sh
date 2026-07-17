@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# One-shot deploy for note-api on a VPS that already has the `gemini` CLI
-# logged in (e.g. your Cheatsheet VPS). Run it from inside the note-api/ folder:
+# One-shot deploy for note-api on a VPS that already has the `agy`
+# (Antigravity CLI) binary installed and logged in (e.g. your Cheatsheet VPS).
+# Run it from inside the note-api/ folder:
 #
 #   cd note-api
 #   chmod +x deploy.sh
@@ -28,11 +29,19 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
 say "Checking prerequisites"
 command -v node >/dev/null || { echo "Node.js is required (node -v). Install it first."; exit 1; }
 command -v npm  >/dev/null || { echo "npm is required."; exit 1; }
-if ! command -v gemini >/dev/null; then
-  warn "The 'gemini' CLI was not found on PATH. Generation will fail until it is installed and logged in."
+
+# agy installs to ~/.local/bin, which is often NOT on pm2's PATH even when it
+# is on your interactive shell's PATH. Resolve a concrete absolute path now
+# and bake it into .env so the service doesn't depend on PATH at all.
+AGY_RESOLVED="$(command -v agy || true)"
+if [ -z "$AGY_RESOLVED" ] && [ -x "$HOME/.local/bin/agy" ]; then
+  AGY_RESOLVED="$HOME/.local/bin/agy"
 fi
-if [ -n "${GEMINI_API_KEY:-}" ]; then
-  warn "GEMINI_API_KEY is set in this shell. The service ignores it, but to be safe: unset GEMINI_API_KEY"
+if [ -z "$AGY_RESOLVED" ]; then
+  warn "The 'agy' (Antigravity CLI) binary was not found on PATH or in ~/.local/bin. Generation will fail until it is installed and logged in: curl -fsSL https://antigravity.google/cli/install.sh | bash"
+  AGY_RESOLVED="agy"
+else
+  echo "  Found agy at: $AGY_RESOLVED"
 fi
 
 # ----------------------------- app -----------------------------
@@ -43,17 +52,17 @@ say "Writing .env"
 cat > .env <<ENV
 PORT=$PORT
 ALLOWED_ORIGIN=$SITE_ORIGIN
-GEMINI_BIN=gemini
+AGY_BIN=$AGY_RESOLVED
 TIMEOUT_MS=120000
 ENV
-echo "  PORT=$PORT  ALLOWED_ORIGIN=$SITE_ORIGIN"
+echo "  PORT=$PORT  ALLOWED_ORIGIN=$SITE_ORIGIN  AGY_BIN=$AGY_RESOLVED"
 
-say "Quick self-test of the gemini CLI (subscription)"
-if command -v gemini >/dev/null; then
-  if (unset GEMINI_API_KEY; echo "reply with the single word OK" | gemini --output-format json >/tmp/gemini_test.json 2>/tmp/gemini_test.err); then
-    echo "  gemini responded OK (subscription auth working)."
+say "Quick self-test of the agy CLI (subscription)"
+if [ -x "$AGY_RESOLVED" ] || command -v "$AGY_RESOLVED" >/dev/null 2>&1; then
+  if ("$AGY_RESOLVED" -p "reply with the single word OK" >/tmp/agy_test.out 2>/tmp/agy_test.err); then
+    echo "  agy responded: $(cat /tmp/agy_test.out) (subscription auth working)."
   else
-    warn "gemini test did not succeed. Log in as this user once: 'gemini' then /login -> Login with Google. See: $(cat /tmp/gemini_test.err 2>/dev/null | head -1)"
+    warn "agy test did not succeed. Log in as this user once: 'agy' then choose 'Login with Google'. See: $(cat /tmp/agy_test.err 2>/dev/null | head -1)"
   fi
 fi
 
@@ -116,4 +125,4 @@ echo "  https://$API_DOMAIN/generate"
 echo
 echo "Final step — open $SITE_ORIGIN, tap the gear (settings), set:"
 echo "  Backend URL = https://$API_DOMAIN/generate"
-echo "  then Save. Notes will generate via your Gemini subscription."
+echo "  then Save. Notes will generate via your Antigravity/Gemini subscription."
